@@ -1,0 +1,474 @@
+# Per-USER hard spend control for Amazon Bedrock when every user assumes the
+# SAME IAM Identity Center (SSO) permission set - i.e. there is no distinct
+# ARN per person, only distinct sessions of the same shared role.
+#
+# ARCHITECTURE NOTE - read this before touching the enforcement logic:
+# The first version of this stack tried to attach a Deny policy directly to
+# the underlying IAM role (AWSReservedSSO_bedrock-limited-access_...) via
+# iam:PutRolePolicy. That is IMPOSSIBLE - AWS returns
+# "UnmodifiableEntityException: this role is only modifiable by AWS" for any
+# AWSReservedSSO_* role, no matter what IAM permissions the caller has. Those
+# roles are exclusively owned by IAM Identity Center.
+#
+# The correct approach - what this template does - is to manage the
+# **Permission Set** instead, through the sso-admin API:
+#   1) GetInlinePolicyForPermissionSet - read the permission set's current
+#      inline policy (this is the same policy you'd see if you inspected the
+#      provisioned role - it contains the real Allow statements, e.g.
+#      "BedrockAPIs", that give users their actual Bedrock access).
+#   2) Strip out our own Deny statement if a previous run already added one
+#      (matched by Sid), keep every other statement untouched.
+#   3) If anyone is currently over budget, append a fresh Deny statement.
+#   4) PutInlinePolicyToPermissionSet - write the combined policy back.
+#   5) ProvisionPermissionSet (TargetType=ALL_PROVISIONED_ACCOUNTS) - push the
+#      change from the Permission Set down into the real IAM role in every
+#      account it's assigned to. This is async - poll
+#      DescribePermissionSetProvisioningStatus until SUCCEEDED.
+#
+# IMPORTANT - this only works if the account these Lambdas run in
+# (396026123718) is either the AWS Organizations MANAGEMENT account, or is
+# registered as the DELEGATED ADMINISTRATOR for IAM Identity Center. A plain
+# member account (even with AdministratorAccess) gets AccessDeniedException
+# on every sso-admin:* call otherwise. This account was registered as
+# delegated administrator on 2026-09-17 via (run from the management
+# account, 872515258828):
+#   aws organizations register-delegated-administrator \
+#     --account-id 396026123718 --service-principal sso.amazonaws.com
+# If this stack is ever redeployed into a fresh account, that step has to be
+# redone first, from the management account, by someone with access to it.
+#
+# SECURITY NOTE: sso:PutInlinePolicyToPermissionSet is a powerful
+# permission - it can rewrite the ENTIRE policy of the permission set, not
+# just add a narrow Deny. It's scoped here to only this one
+# InstanceArn/PermissionSetArn pair, but whoever can invoke or modify these
+# Lambdas effectively controls what "bedrock-limited-access" grants.
+#
+# Read/attribution side (unchanged from the original design):
+#   - Reads Bedrock's model invocation logs (CloudWatch Logs) every N
+#     minutes, current calendar month only.
+#   - Groups token usage by session (identity.arn), extracting the username
+#     from the RoleSessionName (IAM Identity Center automatically fills this
+#     with each user's username/email).
+#   - Converts tokens to USD using a per-model pricing table.
+#   - Self-healing: every run compares the desired blocked-user set against
+#     what's ACTUALLY in the permission set's policy right now, and only
+#     writes+provisions when they differ - so a run that updates DynamoDB but
+#     then fails (network blip, throttling, etc.) gets retried automatically
+#     next cycle instead of silently drifting.
+#   - On day 1 of each month, a second Lambda clears the DynamoDB blocklist
+#     and removes the Deny statement from the permission set.
+#
+# PREREQUISITES (do these BEFORE deploying this stack):
+#   - Enable "Model invocation logging" in Bedrock, pointing to a CloudWatch
+#     Log Group (Bedrock console -> Settings, or via CLI):
+#       aws bedrock put-model-invocation-logging-configuration \
+#         --logging-config '{"cloudWatchConfig":{"logGroupName":"/aws/bedrock/invocations","roleArn":"arn:aws:iam::<ACCOUNT_ID>:role/<BedrockLoggingRole>"}}'
+#   - Confirm this account is a delegated administrator for IAM Identity
+#     Center (see above) - otherwise every sso-admin:* call fails.
+#   - Know the SSO instance ARN and the target permission set's ARN (find
+#     both with `aws sso-admin list-instances` and
+#     `aws sso-admin list-permission-sets` / `describe-permission-set`,
+#     always with --region matching the instance's PrimaryRegion).
+#   - Fill in ModelPricingJson with the REAL, current price per 1K tokens for
+#     every model in use, using the EXACT modelId string as logged (run
+#     `fields modelId | stats count() by modelId` in Logs Insights) - a
+#     cross-region inference profile often logs as the full inference-profile
+#     ARN, not the bare model ID.
+#   - Have an S3 bucket available to stage packaged Lambda code (any bucket
+#     you can write to works). See below.
+#
+# CODE LAYOUT (as of 2026-09-24): the Lambda functions' Python source lives
+# in src/enforcer/index.py and src/reset/index.py, NOT inline in this
+# template. This template's `Code:` properties are local directory paths
+# that `aws cloudformation package` resolves at deploy time -- it zips each
+# directory, uploads it to a staging S3 bucket, and rewrites `Code:` to a
+# real {S3Bucket, S3Key} before `deploy` runs. This means you cannot
+# `aws cloudformation deploy` this template directly; always run
+# `aws cloudformation package` first (or use deploy.sh, which wraps both
+# steps). See README.md's "Deploying" section for exact commands.
+#
+# NOTE on aws:userid: for an assumed-role session, aws:userid has the form
+# "<role-unique-id>:<RoleSessionName>". This template uses StringLike with
+# the pattern "*:<username>" so it doesn't depend on the role-id (which
+# would change if the role were deleted and recreated). This is a DENY
+# condition, so a false negative (failing to block) is the worst case here,
+# never unintended access.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Per-user hard spend control for Amazon Bedrock on a shared SSO permission
+  set: reads Bedrock invocation logs, prices token usage per user, and
+  Deny-blocks anyone over the monthly USD cap by rewriting the permission
+  set's inline policy via sso-admin. See in-file comments for full design
+  notes and prerequisites.
+
+Parameters:
+  SSOInstanceArn:
+    Type: String
+    Default: "arn:aws:sso:::instance/ssoins-79072388697bbe8d"
+    Description: >
+      ARN of the IAM Identity Center instance (from `aws sso-admin
+      list-instances`). Pre-filled for this account/organization.
+
+  PermissionSetArn:
+    Type: String
+    Default: "arn:aws:sso:::permissionSet/ssoins-79072388697bbe8d/ps-7907c9a4bea503c7"
+    Description: >
+      ARN of the "bedrock-limited-access" permission set (from `aws sso-admin
+      list-permission-sets` + `describe-permission-set`). This is the
+      permission set whose inline policy gets rewritten to add/remove the
+      per-user Deny statement.
+
+  BedrockLogGroupName:
+    Type: String
+    Default: /aws/bedrock/invocations
+    Description: CloudWatch log group where Bedrock writes invocation logs.
+
+  MonthlyCapUSD:
+    Type: Number
+    Default: 150
+    Description: Monthly cap in USD per user.
+
+  EvaluationRateMinutes:
+    Type: Number
+    Default: 15
+    Description: How often (in minutes) usage is evaluated and enforcement applied.
+
+  ModelPricingJson:
+    Type: String
+    Description: >
+      JSON with the price per 1000 tokens (input/output) per modelId, EXACTLY
+      as it appears in the "modelId" field of Bedrock's logs. Confirmed
+      2026-09-16 from real CloudWatch Logs Insights output for this account:
+      every current-generation model is invoked through a "Geo and In-region
+      Cross-region Inference" profile in us-west-2 (the "us." prefix), logged
+      either as the full inference-profile ARN or as the short
+      "us.anthropic...." string depending on the call path - never as the
+      bare "anthropic...." model ID for these newer models. Both shapes are
+      included below with the same (correct, Geo/in-region tier - about 10%
+      higher than the Global tier) price, plus the bare form kept as a
+      fallback in case anything ever calls the base model ID directly.
+      IMPORTANT: keep re-running
+        fields modelId | stats count() by modelId
+      in CloudWatch Logs Insights periodically and diff the exact strings
+      against these keys. Lookups here are exact-match, so any new/renamed
+      model or a different call path silently prices that usage at $0 and it
+      will never trigger the cap (the "models missing a price entry" SNS
+      alert is the only safety net for that).
+    Default: >
+      {"anthropic.claude-opus-5": {"input": 0.0055, "output": 0.0275},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-opus-5": {"input": 0.0055, "output": 0.0275},
+       "anthropic.claude-sonnet-5": {"input": 0.0022, "output": 0.011},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-sonnet-5": {"input": 0.0022, "output": 0.011},
+       "anthropic.claude-opus-4-8": {"input": 0.0055, "output": 0.0275},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-opus-4-8": {"input": 0.0055, "output": 0.0275},
+       "anthropic.claude-opus-4-7": {"input": 0.0055, "output": 0.0275},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-opus-4-7": {"input": 0.0055, "output": 0.0275},
+       "anthropic.claude-opus-4-6-v1": {"input": 0.0055, "output": 0.0275},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-opus-4-6-v1": {"input": 0.0055, "output": 0.0275},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/global.anthropic.claude-opus-4-6-v1": {"input": 0.005, "output": 0.025},
+       "global.anthropic.claude-opus-4-6-v1": {"input": 0.005, "output": 0.025},
+       "anthropic.claude-sonnet-4-6": {"input": 0.0033, "output": 0.0165},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-sonnet-4-6": {"input": 0.0033, "output": 0.0165},
+       "us.anthropic.claude-sonnet-4-6": {"input": 0.0033, "output": 0.0165},
+       "anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 0.0033, "output": 0.0165},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 0.0033, "output": 0.0165},
+       "us.anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 0.0033, "output": 0.0165},
+       "anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 0.0011, "output": 0.0055},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 0.0011, "output": 0.0055},
+       "anthropic.claude-opus-4-5-20251101-v1:0": {"input": 0.0055, "output": 0.0275},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-opus-4-5-20251101-v1:0": {"input": 0.0055, "output": 0.0275},
+       "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 0.003, "output": 0.015},
+       "anthropic.claude-opus-4-1-20250805-v1:0": {"input": 0.015, "output": 0.075},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-opus-4-1-20250805-v1:0": {"input": 0.015, "output": 0.075},
+       "anthropic.claude-fable-5-1": {"input": 0.011, "output": 0.055},
+       "arn:aws:bedrock:us-west-2:396026123718:inference-profile/us.anthropic.claude-fable-5-1": {"input": 0.011, "output": 0.055},
+       "us.anthropic.claude-fable-5-1": {"input": 0.011, "output": 0.055},
+       "openai.gpt-5.6-luna": {"input": 0.00022, "output": 0.00132}}
+
+  AlertEmail:
+    Type: String
+    Default: "oscar.gutierrez@billups.com"
+    Description: >
+      (Optional) email for block/reset notifications. Leave empty to skip
+      the email subscription (you can subscribe something else to the
+      output SNS topic later).
+
+  ExemptUsernames:
+    Type: String
+    Default: "audrai_ai_agent"
+    Description: >
+      Comma-separated list of usernames/session-names that are NEVER
+      blocked, no matter how much they spend - for service accounts, bots,
+      or automation agents that share the same SSO permission set as human
+      users but aren't subject to the per-human budget. The enforcer both
+      skips adding these to the blocklist and proactively removes them if
+      they're already on it (self-healing, same as the pricing/policy
+      checks). Leave empty ("") if there's nothing to exempt.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+
+  BlockedUsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-blocked-users"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------------
+  # ENFORCEMENT Lambda (runs every EvaluationRateMinutes)
+  # ---------------------------------------------------------------------
+
+  EnforcerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockLogsRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: "*"
+        - PolicyName: ManagePermissionSetDenyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:GetInlinePolicyForPermissionSet
+                  - sso:PutInlinePolicyToPermissionSet
+                  - sso:DeleteInlinePolicyFromPermissionSet
+                  - sso:ProvisionPermissionSet
+                  - sso:DescribePermissionSetProvisioningStatus
+                Resource:
+                  - !Ref SSOInstanceArn
+                  - !Ref PermissionSetArn
+                  # ProvisionPermissionSet also needs authorization on the
+                  # TARGET account resource it's pushing the change to (this
+                  # is the account(s) the permission set is actually
+                  # assigned to via IAM Identity Center account assignments -
+                  # NOT necessarily the account this Lambda runs in). We hit
+                  # this on 2026-09-18: the Lambda runs in 396026123718 but
+                  # the permission set is provisioned into 930478467842,
+                  # causing "not authorized to perform:
+                  # sso:ProvisionPermissionSet on resource:
+                  # arn:aws:sso:::account/930478467842". Using a wildcard
+                  # instead of a hardcoded account ID so this doesn't break
+                  # again if the permission set gets assigned to yet another
+                  # account.
+                  - "arn:aws:sso:::account/*"
+        - PolicyName: BlockedUsersTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                Resource: !GetAtt BlockedUsersTable.Arn
+        - PolicyName: PublishAlerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+        - PolicyName: Logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:*"
+
+  EnforcerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-enforcer"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 180
+      MemorySize: 256
+      Role: !GetAtt EnforcerFunctionRole.Arn
+      Environment:
+        Variables:
+          BLOCKED_TABLE: !Ref BlockedUsersTable
+          BEDROCK_LOG_GROUP: !Ref BedrockLogGroupName
+          SSO_INSTANCE_ARN: !Ref SSOInstanceArn
+          PERMISSION_SET_ARN: !Ref PermissionSetArn
+          MONTHLY_CAP_USD: !Ref MonthlyCapUSD
+          MODEL_PRICING_JSON: !Ref ModelPricingJson
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          EXEMPT_USERNAMES: !Ref ExemptUsernames
+          DENY_SID: BedrockBudgetHardStopPerUser
+      # Local path -- `aws cloudformation package` zips this directory,
+      # uploads it to the staging S3 bucket, and rewrites this property to
+      # {S3Bucket, S3Key} automatically. See src/enforcer/index.py for the
+      # actual code and README.md's "Deploying" section for the packaging
+      # step. Deploying straight from this template without running
+      # `package` first will fail -- Code needs a real S3 location.
+      Code: src/enforcer/
+
+  EnforcerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-enforcer-schedule"
+      ScheduleExpression: !Sub "rate(${EvaluationRateMinutes} minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EnforcerFunction.Arn
+          Id: EnforcerTarget
+
+  EnforcerScheduleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnforcerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EnforcerSchedule.Arn
+
+  # ---------------------------------------------------------------------
+  # RESET Lambda (day 1 of every month, 00:05 UTC)
+  # ---------------------------------------------------------------------
+
+  ResetFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ManagePermissionSetDenyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:GetInlinePolicyForPermissionSet
+                  - sso:PutInlinePolicyToPermissionSet
+                  - sso:DeleteInlinePolicyFromPermissionSet
+                  - sso:ProvisionPermissionSet
+                  - sso:DescribePermissionSetProvisioningStatus
+                Resource:
+                  - !Ref SSOInstanceArn
+                  - !Ref PermissionSetArn
+                  # See matching comment in EnforcerFunctionRole above -
+                  # wildcarded because the permission set's actual
+                  # provisioned account (930478467842) differs from the
+                  # account this stack is deployed in (396026123718).
+                  - "arn:aws:sso:::account/*"
+        - PolicyName: BlockedUsersTableAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt BlockedUsersTable.Arn
+        - PolicyName: PublishAlerts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+        - PolicyName: Logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:*:${AWS::AccountId}:*"
+
+  ResetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-reset"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt ResetFunctionRole.Arn
+      Environment:
+        Variables:
+          BLOCKED_TABLE: !Ref BlockedUsersTable
+          SSO_INSTANCE_ARN: !Ref SSOInstanceArn
+          PERMISSION_SET_ARN: !Ref PermissionSetArn
+          DENY_SID: BedrockBudgetHardStopPerUser
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+      # Local path -- packaged the same way as EnforcerFunction's Code
+      # above. See src/reset/index.py for the actual code.
+      Code: src/reset/
+
+  ResetSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-reset-schedule"
+      ScheduleExpression: "cron(5 0 1 * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ResetFunction.Arn
+          Id: ResetTarget
+
+  ResetScheduleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResetFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ResetSchedule.Arn
+
+Outputs:
+  BlockedUsersTableName:
+    Value: !Ref BlockedUsersTable
+  EnforcerFunctionArn:
+    Value: !GetAtt EnforcerFunction.Arn
+  ResetFunctionArn:
+    Value: !GetAtt ResetFunction.Arn
+  AlertTopicArn:
+    Description: Subscribe more recipients here if you want (Slack via SNS-to-Lambda, etc.)
+    Value: !Ref AlertTopic
