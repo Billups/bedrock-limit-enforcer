@@ -10,38 +10,6 @@ Stack name used in this doc: `bedrock-budget-hardstop`. Template file:
 `bedrock-budget-hardstop-sso.yaml`. Account: `396026123718`, region
 `us-west-2`.
 
-## Repo layout
-
-```
-bedrock-budget-hardstop-sso.yaml   Infra only: DynamoDB, SNS, IAM roles,
-                                    EventBridge rules, and the two Lambda
-                                    *resource* definitions (runtime,
-                                    handler, env vars, schedule). No Python
-                                    lives in this file.
-deploy.sh                          Wraps `aws cloudformation package` +
-                                    `aws cloudformation deploy` into one
-                                    command. Optional but recommended.
-src/
-  enforcer/index.py                 Enforcer Lambda's actual code.
-  reset/index.py                    Reset Lambda's actual code.
-```
-
-The template's `AWS::Lambda::Function` resources point `Code:` at
-`src/enforcer/` and `src/reset/` as **local directory paths**, not inline
-code. `aws cloudformation package` (or `deploy.sh`, which calls it for you)
-zips each directory, uploads it to an S3 staging bucket, and rewrites those
-paths into real `{S3Bucket, S3Key}` values before the stack deploys. This
-means the template can no longer be deployed directly with
-`aws cloudformation deploy` — always package first. See
-[Deploying](#deploying).
-
-This wasn't always the layout: earlier versions of this stack had both
-Lambdas' Python source inline as `ZipFile:` block scalars inside the YAML
-itself. That worked, but had no linting/type-checking, no realistic way to
-unit-test the handler functions, and noisy diffs on every code change.
-Moving the code into real `.py` files fixed all of that at the cost of one
-extra `package` step before every deploy.
-
 ## Table of contents
 
 - [Why this exists](#why-this-exists)
@@ -98,15 +66,8 @@ This solution                 -->  reads identity.arn from logs, blocks by sessi
 ```
 
 **The enforcement target is the IAM Identity Center Permission Set, not the
-IAM role.** An earlier version of this stack tried to attach a Deny policy
-directly to the underlying role (`AWSReservedSSO_bedrock-limited-access_...`)
-via `iam:PutRolePolicy`. That's impossible — AWS returns
-`UnmodifiableEntityException: this role is only modifiable by AWS` for any
-`AWSReservedSSO_*` role, regardless of what IAM permissions the caller has;
-those roles are exclusively owned by IAM Identity Center. The fix was to
-manage the **Permission Set** instead, through the `sso-admin` API
-(IAM action prefix `sso:`, confusingly — not `sso-admin:`), and let Identity
-Center push the change down into the real role:
+IAM role.** it manages the **Permission Set** through the `sso-admin` API, 
+and let Identity Center push the change down into the real role:
 
 1. `GetInlinePolicyForPermissionSet` — read the permission set's current
    inline policy (this is the same policy that ends up on the provisioned
@@ -172,7 +133,7 @@ gets `AccessDeniedException` on every `sso:*` call otherwise. See
 | Resource | Purpose |
 |---|---|
 | `BlockedUsersTable` (DynamoDB) | Source of truth for who's currently blocked this month. |
-| `AlertTopic` (SNS) + email subscription | Notifies on new blocks, exempt-user unblocks, monthly reset, and models missing a price entry. |
+| `AlertTopic` (SNS) + email subscription | Notifies on new blocks, monthly reset, and models missing a price entry. |
 | `EnforcerFunctionRole` (IAM Role) | Lets the enforcer read Bedrock logs, manage the permission set's inline policy via `sso:*`, and read/write the DynamoDB table. |
 | `EnforcerFunction` (Lambda, Python 3.12) | Runs the read → attribute → price → exempt → enforce → self-heal loop. |
 | `EnforcerSchedule` (EventBridge rule) | Triggers the enforcer every `EvaluationRateMinutes`. |
@@ -221,7 +182,7 @@ already exist:
      don't need.
    - Retention: 60 days is enough (the system only ever looks at the
      current month).
-   - Log class: Standard.
+   - Log class: Infrequent Access.
 
 3. **Know the SSO instance ARN and the target permission set's ARN.** Find
    both with (always with `--region` matching the instance's
@@ -248,18 +209,21 @@ already exist:
    aws sts get-caller-identity   # sanity check: Account should be 396026123718
    ```
 
-5. **An S3 bucket to stage packaged Lambda code.** Since the Lambda source
-   moved out of the template (see [Repo layout](#repo-layout)),
-   `aws cloudformation package` needs somewhere in S3 to upload the zipped
-   `src/enforcer/` and `src/reset/` directories to before every deploy. Any
-   bucket in this account/region you can write to works — it's just a
-   staging area CloudFormation reads from during deploy, not a permanent
-   resource this stack depends on afterward:
+   source lives in `src/enforcer/` and `src/reset/`, not inline in the
+   template, so `deploy.sh` needs somewhere to upload the zipped code to
+   before the stack deploy runs — this bucket is just scratch space
+   (CloudFormation only reads from it during deploy) and can't be created
+   *by* the same template that needs it to already exist, so it's a
+   one-time manual step, separate from the stack:
    ```bash
-   aws s3 mb s3://<your-staging-bucket-name> --region us-west-2
+   aws s3api create-bucket \
+     --bucket bedrock-budget-hardstop-396026123718 \
+     --region us-west-2 \
+     --create-bucket-configuration LocationConstraint=us-west-2
    ```
-   `bedrock-budget-hardstop-cfn-staging` is used as the example bucket name
-   throughout this doc — substitute your own.
+   `bedrock-budget-hardstop-396026123718` already exists in this
+   account and is `deploy.sh`'s default — you only need this step if that
+   bucket is ever deleted or you're deploying into a different account.
 
 ## Parameters reference
 
@@ -273,7 +237,7 @@ only need `--parameter-overrides` when you want to change one.
 | `BedrockLogGroupName` | `/aws/bedrock/invocations` | Must match what Bedrock is actually configured to log to. |
 | `MonthlyCapUSD` | `150` | Cap per user, per calendar month. |
 | `EvaluationRateMinutes` | `15` | How often the enforcer runs. Lower = faster blocking, more Logs Insights scan cost. |
-| `ModelPricingJson` | 29 keys covering 13 models, `us-west-2`, mostly Geo/In-region Cross-region Inference tier with one confirmed Global-tier exception (see table below) | **Must** use the exact `modelId` string as it appears in the logs — see [Known limitations](#known-limitations). |
+| `ModelPricingJson` | 29 keys covering 13 models, `us-west-2`, Geo/In-region Cross-region Inference tier for most models (Global CRIS tier for Opus 4.6 v1's `global.`-prefixed shapes — see [Model pricing table](#model-pricing-table)); confirmed 2026-09-17 | **Must** use the exact `modelId` string as it appears in the logs — see [Known limitations](#known-limitations). |
 | `AlertEmail` | `oscar.gutierrez@billups.com` | Set to `""` to skip the email subscription. |
 | `ExemptUsernames` | `audrai_ai_agent` | Comma-separated usernames/session-names that are never blocked. See [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap). |
 
@@ -293,8 +257,8 @@ is included as its own key, all priced identically per model:
 | Claude Sonnet 5 | $0.0022 | $0.011 | bare, ARN |
 | Claude Opus 4.8 | $0.0055 | $0.0275 | bare, ARN |
 | Claude Opus 4.7 | $0.0055 | $0.0275 | bare, ARN |
-| Claude Opus 4.6 (v1), Geo/In-region CRIS | $0.0055 | $0.0275 | bare, `us.` ARN |
-| Claude Opus 4.6 (v1), Global CRIS | $0.005 | $0.025 | bare `global.` short, `global.` ARN — see note below |
+| Claude Opus 4.6 (v1) | $0.0055 | $0.0275 | bare, ARN (Geo/In-region tier, `us.` shapes) |
+| Claude Opus 4.6 (v1), Global CRIS | $0.005 | $0.025 | bare, ARN (`global.`-prefixed shapes only) |
 | Claude Sonnet 4.6 | $0.0033 | $0.0165 | bare, ARN, `us.` short |
 | Claude Sonnet 4.5 (`20250929-v1:0`) | $0.0033 | $0.0165 | bare, ARN, `us.` short |
 | Claude Haiku 4.5 (`20251001-v1:0`) | $0.0011 | $0.0055 | bare, ARN |
@@ -306,19 +270,17 @@ is included as its own key, all priced identically per model:
 
 Sourcing notes:
 
-- All Anthropic prices are the **Geo and In-region Cross-region Inference**
+- Almost all the Anthropic prices are the **Geo and In-region Cross-region Inference**
   tier for `us-west-2` (Oeste de EE. UU./Oregón), confirmed directly against
-  <https://aws.amazon.com/bedrock/pricing/> (English) and
-  <https://aws.amazon.com/es/bedrock/pricing/> (Spanish — same underlying
-  catalog, numbers match exactly) on 2026-09-17. This tier runs ~10% above
+  <https://aws.amazon.com/bedrock/pricing/> on 2026-09-17. This tier runs ~10% above
   the "Global Cross-region Inference" tier; using the Global price for a
   model actually invoked through Geo/In-region CRIS silently undercounts
-  cost.
-- Claude Fable 5.1 and Claude Sonnet 4.5 are priced the same as their
-  respective base rows (`Claude Fable 5` = $11.00/$55.00 per 1M, `Claude
-  Sonnet 4.5` = $3.30/$16.50 per 1M) — the AWS pricing tables don't list a
-  `5.1` variant separately, and minor version bumps within the same family
-  aren't priced differently on any observed row.
+  cost. **Exception:** Opus 4.6 (v1) is the only model actually observed
+  being called through *both* tiers in this account's logs (`global.`-
+  prefixed `modelId` shapes as well as the `us.`-prefixed ones), so its two
+  `global.`-prefixed keys are intentionally priced at the Global tier
+  instead — that's the source of the 29-vs-27-key/two-price-rows split
+  above.
 - GPT-5.6 Luna's price came from its dedicated model-card page
   (`docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-luna.html`),
   since it isn't in the main pricing page's summary table. Its logged
@@ -330,34 +292,23 @@ Sourcing notes:
   bare model ID for a model that's only ever been seen via ARN, or a brand
   new model), add it as a new key with the same price as its sibling
   shapes — see [Modifying and redeploying](#modifying-and-redeploying).
-- **Don't assume every call goes through the same CRIS tier.** On
-  2026-09-24 the "models missing a price entry" alert caught
-  `arn:aws:bedrock:us-west-2:396026123718:inference-profile/global.anthropic.claude-opus-4-6-v1`
-  — a `global.`-prefixed ARN, meaning that specific call was routed through
-  the cheaper **Global Cross-region Inference** profile instead of
-  Geo/In-region, for a model this account had so far only ever seen via the
-  `us.`-prefixed (Geo/In-region) path. Global and Geo/In-region are priced
-  differently, so this needed its own key at its own (lower) price rather
-  than reusing the existing Opus 4.6 entry. It's worth periodically
-  checking Logs Insights for any `global.`-prefixed `modelId` across
-  *every* model, not just the ones that have already shown up that way:
-  ```
-  fields modelId | filter modelId like /global\./ | stats count() by modelId
-  ```
 
 ## Deploying
 
-Since the Lambda source lives in `src/enforcer/` and `src/reset/` (see
-[Repo layout](#repo-layout)) rather than inline in the template, deploying
-is a **two-step process**: package (zip + upload to S3, rewrite `Code:` to
-point at the upload), then deploy. `deploy.sh` wraps both:
+The Lambda source lives in `src/enforcer/index.py` and `src/reset/index.py`,
+not inline in the template — its `Code:` properties are local directory
+paths that only `aws cloudformation package` can resolve into a real
+`{S3Bucket, S3Key}` before a deploy runs. **Running `aws cloudformation
+deploy` directly on `bedrock-budget-hardstop-sso.yaml` will fail** — always
+go through `deploy.sh`, which wraps `validate-template` → `package` →
+`deploy` in one step:
 
 ```bash
 # 0) Confirm you're targeting the right account/profile
 aws sts get-caller-identity
 
-# 1) Package + deploy in one step
-./deploy.sh bedrock-budget-hardstop-cfn-staging
+# 1) Package + deploy (creates or updates the stack — safe to re-run)
+./deploy.sh
 
 # 2) Confirm it's up
 aws cloudformation describe-stacks \
@@ -366,50 +317,20 @@ aws cloudformation describe-stacks \
   --query "Stacks[0].[StackStatus,Outputs]"
 ```
 
-Or run the two steps by hand, if you'd rather not use the script:
-
+`./deploy.sh` with no args uses the bootstrap staging bucket
+(`bedrock-budget-hardstop-396026123718`) that already exists in this
+account — see [Prerequisites](#prerequisites) #5. Pass a different bucket
+name as the first argument only if that one is unavailable:
+`./deploy.sh my-other-staging-bucket`. Pass CloudFormation parameter
+overrides after `--`, with or without a custom bucket:
 ```bash
-# 0) Confirm you're targeting the right account/profile
-aws sts get-caller-identity
-
-# 1) Validate the template
-aws cloudformation validate-template \
-  --template-body file://bedrock-budget-hardstop-sso.yaml \
-  --region us-west-2
-
-# 2) Package: zips src/enforcer/ and src/reset/, uploads to S3, and writes
-#    a new packaged.yaml with Code: rewritten to real {S3Bucket, S3Key}
-#    values. Re-run this every time you change a .py file OR the template.
-aws cloudformation package \
-  --template-file bedrock-budget-hardstop-sso.yaml \
-  --s3-bucket bedrock-budget-hardstop-cfn-staging \
-  --output-template-file packaged.yaml \
-  --region us-west-2
-
-# 3) Deploy the packaged template (creates or updates the stack — safe to
-#    re-run). Note: deploy against packaged.yaml, not the original file —
-#    the original still has local paths in Code: and will fail.
-aws cloudformation deploy \
-  --template-file packaged.yaml \
-  --stack-name bedrock-budget-hardstop \
-  --capabilities CAPABILITY_IAM \
-  --region us-west-2
-
-# 4) Confirm it's up
-aws cloudformation describe-stacks \
-  --stack-name bedrock-budget-hardstop \
-  --region us-west-2 \
-  --query "Stacks[0].[StackStatus,Outputs]"
+./deploy.sh -- MonthlyCapUSD=150 ExemptUsernames="audrai_ai_agent"
+./deploy.sh my-other-staging-bucket -- MonthlyCapUSD=150
 ```
 
 Then check the inbox for `AlertEmail` and click **Confirm subscription** on
 the SNS email AWS sends — until that's confirmed, block/reset notifications
 go nowhere.
-
-`packaged.yaml` is a build artifact (like a compiled binary) — it's
-regenerated by every `package` run and shouldn't be hand-edited or treated
-as the source of truth. Always edit `bedrock-budget-hardstop-sso.yaml` (and
-the files under `src/`), never `packaged.yaml` directly.
 
 ## Testing before you trust it
 
@@ -431,21 +352,7 @@ relying on it:
    *previous* value for any parameter you don't pass, even if you changed
    the template's `Default`):
    ```bash
-   ./deploy.sh bedrock-budget-hardstop-cfn-staging -- MonthlyCapUSD=1
-   ```
-   or, without the script:
-   ```bash
-   aws cloudformation package \
-     --template-file bedrock-budget-hardstop-sso.yaml \
-     --s3-bucket bedrock-budget-hardstop-cfn-staging \
-     --output-template-file packaged.yaml \
-     --region us-west-2
-   aws cloudformation deploy \
-     --template-file packaged.yaml \
-     --stack-name bedrock-budget-hardstop \
-     --capabilities CAPABILITY_IAM \
-     --region us-west-2 \
-     --parameter-overrides MonthlyCapUSD=1
+   ./deploy.sh -- MonthlyCapUSD=1
    ```
    Have a test user make one small Bedrock call, invoke the enforcer Lambda
    manually (step 1), then have that same user try again — it should fail
@@ -454,7 +361,7 @@ relying on it:
 
 3. **Restore the real cap:**
    ```bash
-   ./deploy.sh bedrock-budget-hardstop-cfn-staging -- MonthlyCapUSD=150
+   ./deploy.sh -- MonthlyCapUSD=150
    ```
    Note: this does **not** automatically unblock the test user — they stay
    blocked until the monthly reset runs, or until you remove them (see
@@ -472,40 +379,21 @@ relying on it:
 
 ## Modifying and redeploying
 
-Two kinds of edits now, depending on what changed:
-
-- **Template/parameter changes** (anything in `bedrock-budget-hardstop-sso.yaml`
-  outside the Lambda `Code:` properties): edit the file, then re-run
-  `./deploy.sh <staging-bucket>` (or the manual `package` + `deploy` pair).
-- **Lambda logic changes** (anything in `src/enforcer/index.py` or
-  `src/reset/index.py`): edit the `.py` file directly — real Python, so
-  your editor's linting/syntax checking works normally — then run the same
-  `./deploy.sh <staging-bucket>`. `package` re-zips and re-uploads whichever
-  directory changed; `deploy` only updates the Lambda(s) whose code
-  actually differs.
-
-In both cases, `aws cloudformation deploy` diffs against the live stack
-and only updates what changed. Common edits:
+Edit `bedrock-budget-hardstop-sso.yaml`, then re-run `./deploy.sh` (with the
+same bucket/overrides as before, if any) — `aws cloudformation deploy` diffs
+against the live stack and only updates what changed. Common edits:
 
 - **Change the cap:** edit `MonthlyCapUSD`'s `Default`, or pass
-  `./deploy.sh <bucket> -- MonthlyCapUSD=<value>` without editing the file
-  (remember: pass it explicitly, editing the `Default` alone isn't picked
-  up for an existing stack).
-- **Add a new model:** add an entry to the `ModelPricingJson` default in
-  the template (or override it wholesale via `--parameter-overrides`). Get
-  the price from <https://aws.amazon.com/bedrock/pricing/> (select the
-  provider, pick region `us-west-2`) and the exact `modelId` from a Logs
-  Insights query as described above — never guess either one. Check
-  **which CRIS tier** the call actually used (the `us.`/`global.` prefix in
-  the ARN) before picking a price — see the Opus 4.6 sourcing note above;
-  don't assume every model uses the same tier. Divide the page's per-1M
-  price by 1000 to get the per-1K value this template expects.
-- **Change enforcement logic:** edit `src/enforcer/index.py` (e.g.
-  `apply_blocklist()`, `extract_username()`) or `src/reset/index.py`
-  directly, then redeploy as above. Consider adding a quick local sanity
-  check before deploying, e.g. `python3 -m py_compile src/enforcer/index.py
-  src/reset/index.py`, or a small pytest file that imports the module with
-  mocked env vars/boto3 clients if this grows further.
+  `--parameter-overrides MonthlyCapUSD=<value>` without editing the file
+  (remember: pass it explicitly on `deploy`, editing the `Default` alone
+  isn't picked up for an existing stack).
+- **Add a new model:** add an entry to the `ModelPricingJson` default (or
+  override it wholesale via `--parameter-overrides`). Get the price from
+  <https://aws.amazon.com/bedrock/pricing/> (select the provider, pick
+  region `us-west-2`, use the **Geo and In-region Cross-region Inference**
+  tier for Anthropic models) and the exact `modelId` from a Logs Insights
+  query as described above — never guess either one. Divide the page's
+  per-1M price by 1000 to get the per-1K value this template expects.
 - **Change how often it checks:** edit `EvaluationRateMinutes`. Lower
   values catch overages faster but scan more data per run (see
   [Known limitations](#known-limitations) on cost).
@@ -532,8 +420,7 @@ application, which should never be blocked regardless of spend. That's what
    ```
    or pass it on deploy without editing the file:
    ```bash
-   ./deploy.sh bedrock-budget-hardstop-cfn-staging -- \
-     ExemptUsernames="audrai_ai_agent,some_other_service_account"
+   ./deploy.sh -- ExemptUsernames="audrai_ai_agent,some_other_service_account"
    ```
 2. Redeploy (either form above). This updates the Lambdas'
    `EXEMPT_USERNAMES` environment variable — no code change needed.
@@ -601,10 +488,13 @@ reset."
 ## Monitoring
 
 - **SNS (`AlertTopic`)** — one email when new users get blocked (with the
-  cost that tripped it), one when an exempt user is proactively unblocked,
-  one on the monthly reset, and one if any `modelId` shows up in the logs
-  with no matching price entry (meaning its cost isn't being counted at
-  all — treat this as a "fix `ModelPricingJson` now" alert).
+  cost that tripped it), one on the monthly reset, and one if any `modelId`
+  shows up in the logs with no matching price entry (meaning its cost isn't
+  being counted at all — treat this as a "fix `ModelPricingJson` now"
+  alert). Note: exempt-user auto-unblocks (see
+  [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)) are
+  silent — check the DynamoDB table or CloudWatch Logs if you need to
+  confirm one happened, no email is sent for it.
 - **CloudWatch Logs** for the Lambdas themselves:
   `/aws/lambda/bedrock-budget-hardstop-enforcer` and
   `/aws/lambda/bedrock-budget-hardstop-reset` — check here first for any
@@ -671,82 +561,13 @@ reset."
 permission set, not `bedrock-limited-access`), then `export
 AWS_PROFILE=<name>` or add `--profile <name>` to every command.
 
-**`ValidateTemplate` → `'Description' length is greater than 1024`**
-CloudFormation's top-level `Description` field has a hard 1024-character
-cap. Long design notes belong in a `#` comment at the top of the file
-instead of the `Description:` field — those aren't sent to AWS and don't
-count against the limit.
-
 **`aws cloudformation deploy` says "No changes to deploy" after editing a
 parameter's `Default` in the file**
 `aws cloudformation deploy` uses `UsePreviousValue=true` for any parameter
 not explicitly passed via `--parameter-overrides` on an update to an
 existing stack — it does **not** pick up a changed `Default` from the
 template file. Always pass the changed parameter explicitly:
-`--parameter-overrides MonthlyCapUSD=<value>`.
-
-**Deploying fails with something like "Property `Code` cannot have both
-`S3Bucket`/`S3Key` and a local path" or the Lambda ends up with literally
-`src/enforcer/` as its code**
-This means `aws cloudformation deploy` was run directly against
-`bedrock-budget-hardstop-sso.yaml` instead of against the packaged output.
-`Code: src/enforcer/` (and `src/reset/`) are local paths that only mean
-something to `aws cloudformation package` — always run `package` first (or
-use `deploy.sh`, which does this for you) and deploy the resulting
-`packaged.yaml`, never the original template.
-
-**Edited `src/enforcer/index.py` or `src/reset/index.py`, redeployed, but
-the running Lambda's behavior didn't change**
-Almost always means `package` wasn't re-run after the code edit, so
-`deploy` pushed the same (stale) S3 object it already knew about. `package`
-re-zips and re-uploads on every run, so re-running the full `./deploy.sh
-<bucket>` (not just `aws cloudformation deploy` on an old `packaged.yaml`)
-picks up the change. If you're scripting this yourself without
-`deploy.sh`, double check you're re-running `package` before `deploy`
-every time, not just re-running `deploy` against a previously generated
-`packaged.yaml`.
-
-**`AccessDeniedException` on any `sso:*` call
-(`GetInlinePolicyForPermissionSet`, `ProvisionPermissionSet`, etc.), even
-though the Lambda's IAM policy looks correct**
-Two independent causes, both seen during setup:
-- *Wrong IAM action prefix.* The `sso-admin` boto3/CLI **service** name is
-  not the IAM **action** prefix — the actual required prefix is `sso:`, not
-  `sso-admin:`. The Lambda's own error message will show the correct prefix
-  it was denied on (e.g. `"is not authorized to perform:
-  sso:GetInlinePolicyForPermissionSet"`) — trust that over the service name.
-- *Not a delegated administrator.* These APIs only work from the
-  Organizations management account or a delegated administrator account for
-  IAM Identity Center (see [Prerequisites](#prerequisites)). A member
-  account's local `AdministratorAccess` is not sufficient — this produces
-  the identical `AccessDeniedException`, so don't assume it's an IAM policy
-  bug without checking this first.
-
-**`403` specifically on `ProvisionPermissionSet`, with everything else
-working**
-This action requires authorization on the target **account** resource too,
-not just `SSOInstanceArn`/`PermissionSetArn`. Make sure the Lambda role's
-`sso:*` statement's `Resource` list includes
-`arn:aws:sso:::account/${AWS::AccountId}` (already present in this
-template's roles) — if the permission set is ever assigned to additional
-accounts, add each of those accounts' ARNs too.
-
-**`ValidationException: Invalid PermissionsPolicy Document {"Statement":
-[]}`**
-IAM Identity Center rejects `PutInlinePolicyToPermissionSet` with an empty
-`Statement` array. This happens naturally when removing the last statement
-from the inline policy slot (e.g. the reset Lambda clearing the only Deny
-statement that was ever in there). Use
-`DeleteInlinePolicyFromPermissionSet` instead whenever the resulting
-statement list is empty — both Lambdas in this template already do this.
-
-**`UnmodifiableEntityException` on `iam:PutRolePolicy`/similar direct IAM
-role calls**
-This means something is trying to modify the underlying
-`AWSReservedSSO_*` role directly. That's permanently blocked by AWS for any
-caller — manage the Permission Set via `sso-admin`/`sso:` APIs instead (see
-[How it works](#how-it-works)). Not expected to occur with this template's
-current code, but worth knowing if this is ever extended.
+`./deploy.sh -- MonthlyCapUSD=<value>`.
 
 **A user isn't getting blocked despite being over cap**
 Check the enforcer's CloudWatch Logs for the run in question, and look at

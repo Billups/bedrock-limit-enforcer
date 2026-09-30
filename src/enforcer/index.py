@@ -224,6 +224,14 @@ def lambda_handler(event, context):
         total_in = float(r.get("totalIn", 0) or 0)
         total_out = float(r.get("totalOut", 0) or 0)
 
+        if not model:
+            # Logs Insights emits one all-null result row per query when any
+            # log entry lacks both identity.arn and modelId (e.g. non-invoke
+            # entries sharing this log group). That's not a real model to
+            # price -- skip it silently instead of flagging it as unpriced,
+            # so the alert stays a real signal for actual new/renamed models.
+            continue
+
         price = PRICING.get(model)
         if not price:
             unpriced_models.add(model)

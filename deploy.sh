@@ -3,16 +3,18 @@
 # bedrock-budget-hardstop CloudFormation stack in one step.
 #
 # Usage:
-#   ./deploy.sh <staging-s3-bucket> [-- <extra --parameter-overrides args>]
+#   ./deploy.sh [staging-s3-bucket] [-- <extra --parameter-overrides args>]
 #
 # Examples:
-#   ./deploy.sh my-cfn-staging-bucket
-#   ./deploy.sh my-cfn-staging-bucket -- MonthlyCapUSD=150 ExemptUsernames="audrai_ai_agent"
+#   ./deploy.sh
+#   ./deploy.sh -- MonthlyCapUSD=150 ExemptUsernames="audrai_ai_agent"
+#   ./deploy.sh my-other-staging-bucket -- MonthlyCapUSD=150
 #
 # Requires: AWS CLI configured (AWS_PROFILE / --profile), region us-west-2.
 # The staging bucket just needs to be any bucket in the same account/region
 # you can write to -- CloudFormation only reads from it during deploy, it's
-# not a permanent part of the stack.
+# not a permanent part of the stack. Defaults to the bootstrap bucket created
+# for this account; pass a different bucket name as the first arg to override.
 
 set -euo pipefail
 
@@ -21,19 +23,16 @@ REGION="us-west-2"
 TEMPLATE="bedrock-budget-hardstop-sso.yaml"
 PACKAGED="packaged.yaml"
 
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <staging-s3-bucket> [-- <parameter-overrides...>]" >&2
-  exit 1
+BUCKET="bedrock-budget-hardstop-396026123718"
+if [[ "${1:-}" != "" && "${1}" != "--" ]]; then
+  BUCKET="$1"
+  shift
 fi
 
-BUCKET="$1"
-shift
-
-PARAM_OVERRIDES=()
 if [[ "${1:-}" == "--" ]]; then
   shift
-  PARAM_OVERRIDES=("$@")
 fi
+PARAM_OVERRIDES=("$@")
 
 echo "==> Validating template"
 aws cloudformation validate-template \
