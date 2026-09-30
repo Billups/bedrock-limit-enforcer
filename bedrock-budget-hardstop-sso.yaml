@@ -236,7 +236,15 @@ Resources:
     Condition: HasAlertEmail
     Properties:
       TopicArn: !Ref AlertTopic
-      Protocol: email
+      # email-json, not email: the plain "email" protocol renders
+      # notifications (and the unsubscribe footer) as HTML with a real
+      # clickable <a href> link, which corporate email security gateways
+      # (Safe Links/Proofpoint/Mimecast-style anchor-tag pre-fetching) will
+      # silently visit and unsubscribe on their own, with no CloudTrail
+      # trace since it never becomes a real signed API call. email-json
+      # delivers the notification as a plain-text JSON blob instead --
+      # there's no anchor tag for that scanning layer to find.
+      Protocol: email-json
       Endpoint: !Ref AlertEmail
 
   # ---------------------------------------------------------------------

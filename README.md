@@ -328,9 +328,16 @@ overrides after `--`, with or without a custom bucket:
 ./deploy.sh my-other-staging-bucket -- MonthlyCapUSD=150
 ```
 
-Then check the inbox for `AlertEmail` and click **Confirm subscription** on
-the SNS email AWS sends — until that's confirmed, block/reset notifications
-go nowhere.
+Then check the inbox for `AlertEmail` for AWS's subscription confirmation
+message. The subscription uses the `email-json` protocol (not `email`) —
+see the `AlertEmailSubscription` resource's comment in the template for
+why — so this arrives as a raw JSON blob rather than a nicely formatted
+"Confirm subscription" email: copy the `SubscribeURL` field's value out of
+the JSON and open it in a browser. Until that's done, block/reset
+notifications go nowhere. Ongoing alert emails will also show up as raw
+JSON (the real content is in the `Message` field) rather than clean plain
+text — that's the tradeoff for not getting silently unsubscribed by
+corporate email link-scanners.
 
 ## Testing before you trust it
 
