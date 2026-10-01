@@ -598,6 +598,16 @@ one UTC day, read-only. Useful for validating `model-pricing.json` changes
   resets can't happen) until someone notices via the Lambda error logs.
 - **CloudFormation doesn't know about the Deny statement.** See
   [Tearing it down](#tearing-it-down).
+- **Only enforces on the shared permission set.** The Deny statement is
+  written into the `bedrock-limited-access` permission set, so it only
+  affects sessions that assume that role. A standalone IAM user/role with
+  its own Bedrock grant is invisible to enforcement — their usage still gets
+  tracked (via the `:user/` ARN fallback in `extract_username`) and they can
+  still be marked `blocked` in DynamoDB, but that block has no real effect,
+  since neither the policy attachment nor the `aws:userid` condition
+  (`<role-id>:<session-name>`, which only exists for assumed-role sessions)
+  reaches them. If anyone has Bedrock access outside this permission set,
+  this system can't cap them.
 
 ## Troubleshooting
 
