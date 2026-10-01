@@ -22,6 +22,8 @@ STACK_NAME="bedrock-budget-hardstop"
 REGION="us-west-2"
 TEMPLATE="bedrock-budget-hardstop-sso.yaml"
 PACKAGED="packaged.yaml"
+PRICING_FILE="model-pricing.json"
+PRICING_KEY="model-pricing.json"
 
 BUCKET="bedrock-budget-hardstop-396026123718"
 if [[ "${1:-}" != "" && "${1}" != "--" ]]; then
@@ -32,7 +34,13 @@ fi
 if [[ "${1:-}" == "--" ]]; then
   shift
 fi
-PARAM_OVERRIDES=("$@")
+# StagingBucketName must match $BUCKET -- it's how the enforcer's IAM policy
+# knows which bucket to allow s3:GetObject on for model-pricing.json. Put it
+# first so an explicit override in "$@" (if ever needed) still wins.
+PARAM_OVERRIDES=("StagingBucketName=${BUCKET}" "$@")
+
+echo "==> Validating model pricing JSON"
+python3 -c "import json; json.load(open('${PRICING_FILE}'))"
 
 echo "==> Validating template"
 aws cloudformation validate-template \
@@ -47,20 +55,15 @@ aws cloudformation package \
   --region "${REGION}"
 
 echo "==> Deploying stack ${STACK_NAME}"
-if [[ ${#PARAM_OVERRIDES[@]} -gt 0 ]]; then
-  aws cloudformation deploy \
-    --template-file "${PACKAGED}" \
-    --stack-name "${STACK_NAME}" \
-    --capabilities CAPABILITY_IAM \
-    --region "${REGION}" \
-    --parameter-overrides "${PARAM_OVERRIDES[@]}"
-else
-  aws cloudformation deploy \
-    --template-file "${PACKAGED}" \
-    --stack-name "${STACK_NAME}" \
-    --capabilities CAPABILITY_IAM \
-    --region "${REGION}"
-fi
+aws cloudformation deploy \
+  --template-file "${PACKAGED}" \
+  --stack-name "${STACK_NAME}" \
+  --capabilities CAPABILITY_IAM \
+  --region "${REGION}" \
+  --parameter-overrides "${PARAM_OVERRIDES[@]}"
+
+echo "==> Uploading ${PRICING_FILE} to s3://${BUCKET}/${PRICING_KEY}"
+aws s3 cp "${PRICING_FILE}" "s3://${BUCKET}/${PRICING_KEY}" --region "${REGION}" > /dev/null
 
 echo "==> Done. Stack outputs:"
 aws cloudformation describe-stacks \
