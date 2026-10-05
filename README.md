@@ -252,10 +252,14 @@ after every deploy. The enforcer reads it from S3 fresh on every run, so editing
 
 Prices live in `model-pricing.json` (repo root) — USD per **1,000 tokens**
 (AWS's own pricing pages quote per **1,000,000** — divide by 1000 when
-copying from there), keyed by the exact `modelId` string as logged
-(exact-match lookup; see [Known limitations](#known-limitations)). Each
-model entry has `input`, `output`, `cacheRead`, `cacheWrite5m`, and
-`cacheWrite1h` rates.
+copying from there). The lookup key is the logged `modelId` with any
+`arn:aws:bedrock:...:inference-profile/` prefix stripped — i.e. matched on
+the substring after the last `/`, so a full inference-profile ARN and its
+bare model/profile-id equivalent share one entry instead of needing a
+duplicate. Still an exact-match lookup on that trailing segment (see
+[Known limitations](#known-limitations)) — just no longer tied to a
+specific account ID or region baked into an ARN. Each model entry has
+`input`, `output`, `cacheRead`, `cacheWrite5m`, and `cacheWrite1h` rates.
 
 Sourcing notes:
 
@@ -279,7 +283,11 @@ Sourcing notes:
 - If a model shows up in the logs with a shape not listed above (e.g. a
   bare model ID for a model that's only ever been seen via ARN, or a brand
   new model), add it as a new key with the same price as its sibling
-  shapes — see [Modifying and redeploying](#modifying-and-redeploying).
+  shapes — see [Modifying and redeploying](#modifying-and-redeploying). If
+  the new shape is a full inference-profile ARN, key it by just the
+  substring after the last `/` (e.g. `us.anthropic.claude-...`), not the
+  whole ARN — the lookup strips the ARN prefix before matching, so a
+  full-ARN key would just be dead weight.
 
 ## Deploying
 
@@ -388,8 +396,11 @@ against the live stack and only updates what changed. Common edits:
   (select the provider, pick region `us-west-2`, use the **Geo and
   In-region Cross-region Inference** tier for Anthropic models) and the
   exact `modelId` from a Logs Insights query as described above — never
-  guess either one. Divide the page's per-1M price by 1000 to get the
-  per-1K value this file expects.
+  guess either one. If the logged shape is a full inference-profile ARN,
+  key the entry by just the substring after the last `/` (see
+  [Model pricing table](#model-pricing-table)), not the whole ARN. Divide
+  the page's per-1M price by 1000 to get the per-1K value this file
+  expects.
 - **Change how often it checks:** edit `EvaluationRateMinutes`. Lower
   values catch overages faster but scan more data per run (see
   [Known limitations](#known-limitations) on cost).
@@ -563,11 +574,17 @@ one UTC day, read-only. Useful for validating `model-pricing.json` changes
   top of that. A user can overshoot the cap by a small amount before the
   Deny actually lands. Lower `EvaluationRateMinutes` to shrink this window;
   it can't be reduced to zero with this architecture.
-- **Exact-match pricing.** `model-pricing.json` keys must match the logged
-  `modelId` string byte-for-byte, including any cross-region-inference
-  prefix or ARN form. A mismatch fails silently (that model's usage is
-  priced at $0, never counted, never blocked) — the only guardrail is the
-  "models missing a price entry" SNS alert, so don't ignore it.
+- **Exact-match pricing.** The enforcer strips any
+  `arn:aws:bedrock:...:inference-profile/` prefix off the logged `modelId`
+  (matching on the substring after the last `/`) before looking it up, so
+  a full inference-profile ARN and its bare model/profile-id equivalent
+  share one `model-pricing.json` entry, and pricing no longer depends on
+  the account ID/region baked into that ARN. It's still an exact-match
+  lookup on that trailing segment, though — any other mismatch (a renamed
+  model, an unexpected cross-region-inference prefix) fails silently
+  (that model's usage is priced at $0, never counted, never blocked) — the
+  only guardrail is the "models missing a price entry" SNS alert, so don't
+  ignore it.
 - **Cache-write TTL ambiguity.** The invocation log's
   `cacheWriteInputTokenCount` doesn't distinguish a 5-minute from a 1-hour
   cache write, so the enforcer prices all of it at the 5-minute rate (the

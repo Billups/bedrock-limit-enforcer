@@ -118,7 +118,8 @@ def main():
         username = extract_username(r.get("principal", ""))
         if args.user and args.user not in username:
             continue
-        price = pricing.get(model)
+        # Same ARN-or-bare-id normalization as the enforcer.
+        price = pricing.get(model.rsplit("/", 1)[-1])
         if not price:
             unpriced.add(model)
             continue

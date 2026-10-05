@@ -258,7 +258,10 @@ def lambda_handler(event, context):
             # so the alert stays a real signal for actual new/renamed models.
             continue
 
-        price = pricing.get(model)
+        # modelId can be logged as a bare model/profile id or as the full
+        # inference-profile ARN -- both forms carry the same price, so match
+        # on the substring after the last "/" (unchanged if there is none).
+        price = pricing.get(model.rsplit("/", 1)[-1])
         if not price:
             unpriced_models.add(model)
             continue
