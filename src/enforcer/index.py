@@ -29,6 +29,12 @@ Runs on a schedule (every EvaluationRateMinutes, via EventBridge). Each run:
      actual state differs from DynamoDB's desired state, so a prior run that
      updated DynamoDB but crashed before provisioning gets corrected here
      automatically.
+  7. Also emails the affected user directly via SES (if SES_SENDER_EMAIL is
+     set) -- once at WARN_THRESHOLD_FRACTION of their cap, and once the
+     moment they're newly blocked -- independent of the batched admin SNS
+     alert above. A username that isn't a valid email (e.g. a service
+     account) is silently skipped, and an SES failure is logged but never
+     allowed to abort the run.
 
 See the CloudFormation template's header comment and the project README for
 the full architecture rationale (why the Permission Set and not the IAM role
@@ -37,6 +43,7 @@ requirement, etc.) -- this file is intentionally just the runtime logic.
 """
 
 import json
+import logging
 import os
 import re
 import time
@@ -44,11 +51,15 @@ from datetime import datetime, timezone
 
 import boto3
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
 logs_client = boto3.client("logs")
 ssoadmin = boto3.client("sso-admin")
 ddb = boto3.resource("dynamodb")
 sns = boto3.client("sns")
 s3 = boto3.client("s3")
+ses = boto3.client("ses")
 
 TABLE_NAME = os.environ["BLOCKED_TABLE"]
 LOG_GROUP = os.environ["BEDROCK_LOG_GROUP"]
@@ -59,6 +70,7 @@ CAP_USD = float(os.environ["MONTHLY_CAP_USD"])
 PRICING_BUCKET = os.environ["MODEL_PRICING_BUCKET"]
 PRICING_KEY = os.environ["MODEL_PRICING_KEY"]
 TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
+SES_SENDER_EMAIL = os.environ.get("SES_SENDER_EMAIL")
 EXEMPT_USERNAMES = {
     u.strip() for u in os.environ.get("EXEMPT_USERNAMES", "").split(",") if u.strip()
 }
@@ -72,6 +84,12 @@ DENIED_ACTIONS = [
     "bedrock:ConverseStream",
 ]
 
+# Fixed by design, not a CFN parameter -- this is a notification-timing
+# detail nobody has asked to tune, unlike MONTHLY_CAP_USD.
+WARN_THRESHOLD_FRACTION = 0.75
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
 
 def extract_username(principal_arn):
     """From the assumed-role session ARN, extract the RoleSessionName
@@ -84,6 +102,34 @@ def extract_username(principal_arn):
     if m2:
         return m2.group(1)
     return principal_arn
+
+
+def is_valid_email(username):
+    """True only if username looks like a real email address. Service
+    account usernames (e.g. audrai_ai_agent) deliberately fail this check
+    silently -- they're not emails and have no inbox to notify."""
+    return bool(EMAIL_RE.match(username))
+
+
+def send_user_email(username, subject, body):
+    """Best-effort per-user notification via SES. Must never raise -- an
+    SES error (sandbox restriction, unverified recipient, throttling,
+    missing SES_SENDER_EMAIL) is logged and swallowed so it can't abort
+    enforcement; DynamoDB writes and the permission-set Deny rewrite have
+    to happen either way."""
+    if not SES_SENDER_EMAIL or not is_valid_email(username):
+        return
+    try:
+        ses.send_email(
+            Source=SES_SENDER_EMAIL,
+            Destination={"ToAddresses": [username]},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": body}},
+            },
+        )
+    except Exception:
+        logger.exception("Failed to send SES notification to %s", username)
 
 
 def month_start_epoch_seconds():
@@ -297,17 +343,29 @@ def lambda_handler(event, context):
     # global MONTHLY_CAP_USD, which only applies to users with no override.
     now_iso = datetime.now(timezone.utc).isoformat()
     newly_blocked = []
+    newly_warned = []
     for username, cost in cost_by_user.items():
         is_exempt = username in EXEMPT_USERNAMES
 
         existing = table.get_item(Key={"username": username}).get("Item") or {}
         was_blocked = bool(existing.get("blocked"))
+        was_warned = bool(existing.get("warnedAt"))
         try:
             effective_cap = float(existing["capUsd"]) if "capUsd" in existing else CAP_USD
         except (TypeError, ValueError):
             effective_cap = CAP_USD
 
         should_block = (not is_exempt) and cost >= effective_cap
+        # Only warn on the way up to the cap -- a user who jumps straight
+        # from under 75% to over 100% in one evaluation cycle gets just the
+        # block email below, not a redundant warning first.
+        should_warn = (
+            (not is_exempt)
+            and not should_block
+            and not was_blocked
+            and not was_warned
+            and cost >= WARN_THRESHOLD_FRACTION * effective_cap
+        )
 
         item = {
             "username": username,
@@ -320,11 +378,43 @@ def lambda_handler(event, context):
         if should_block:
             item["blockedAt"] = existing.get("blockedAt") if was_blocked else now_iso
             item["costAtBlock"] = existing.get("costAtBlock") if was_blocked else str(round(cost, 2))
+        if was_warned:
+            item["warnedAt"] = existing["warnedAt"]
+        elif should_warn:
+            item["warnedAt"] = now_iso
 
         table.put_item(Item=item)
 
+        if should_warn:
+            newly_warned.append((username, cost, effective_cap))
+            send_user_email(
+                username,
+                subject="Bedrock usage notice: you're near your monthly budget",
+                body=(
+                    f"Your personal Amazon Bedrock usage this month is "
+                    f"${cost:.2f}, which has reached "
+                    f"{WARN_THRESHOLD_FRACTION * 100:.0f}% of your "
+                    f"${effective_cap:.0f}/month cap. This is based on your own "
+                    f"usage only, not a shared/team alert. If you reach the "
+                    f"full cap, your Bedrock access will be automatically "
+                    f"blocked for the rest of the calendar month."
+                ),
+            )
+
         if should_block and not was_blocked:
             newly_blocked.append((username, cost, effective_cap))
+            send_user_email(
+                username,
+                subject="Bedrock access blocked: monthly budget reached",
+                body=(
+                    f"Your personal Amazon Bedrock usage this month reached "
+                    f"${cost:.2f}, at or above your ${effective_cap:.0f}/month "
+                    f"cap. Your Bedrock access has been blocked for the rest "
+                    f"of the calendar month. This is based on your own usage "
+                    f"only, not a team-wide limit. Access resets "
+                    f"automatically on the 1st."
+                ),
+            )
 
     # Self-heal: an exempt username should never stay blocked, even if it
     # got added before ExemptUsernames included it (or before this parameter
@@ -384,6 +474,7 @@ def lambda_handler(event, context):
     return {
         "evaluated_users": len(cost_by_user),
         "newly_blocked": [u for u, _, _ in newly_blocked],
+        "newly_warned": [u for u, _, _ in newly_warned],
         "newly_unblocked_exempt": newly_unblocked_exempt,
         "total_blocked": all_blocked,
         "permission_set_policy_updated": policy_changed,

@@ -227,6 +227,27 @@ already exist:
    account and is `deploy.sh`'s default — you only need this step if that
    bucket is ever deleted or you're deploying into a different account.
 
+5. **(Optional) SES sending identity verified, if using per-user emails.**
+   `SesSenderEmail` sends warning/block notifications directly to each
+   user via Amazon SES. SES requires the *sending* identity (the address
+   or domain in `SesSenderEmail`) to be verified, and by default new SES
+   accounts are in the **sandbox**, which also requires every *recipient*
+   address to be individually verified before SES will deliver to it —
+   a non-starter for arbitrary per-user corporate email addresses. Before
+   relying on this feature in production, request SES production access
+   (AWS Console → SES → Account dashboard → "Request production access")
+   for this account/region. Until that's granted, per-user emails to
+   unverified recipients fail silently from the enforcer's perspective
+   (caught, logged to CloudWatch, enforcement is unaffected) — check
+   `/aws/lambda/bedrock-budget-hardstop-enforcer` logs for `Failed to
+   send SES notification to ...` if users report not receiving expected
+   emails. Leave `SesSenderEmail` as `""` to skip this entirely and rely
+   on the existing admin SNS alert only.
+   ```bash
+   aws ses verify-email-identity --email-address <sender>@yourdomain.com --region us-west-2
+   aws ses get-send-quota --region us-west-2   # sandbox: Max24HourSend is 200
+   ```
+
 ## Parameters reference
 
 All have working defaults baked into the template for this account — you
@@ -241,6 +262,7 @@ only need `--parameter-overrides` when you want to change one.
 | `EvaluationRateMinutes` | `15` | How often the enforcer runs. Lower = faster blocking, more Logs Insights scan cost. |
 | `AlertEmail` | `oscar.gutierrez@billups.com` | Set to `""` to skip the email subscription. |
 | `ExemptUsernames` | `audrai_ai_agent` | Comma-separated usernames/session-names that are never blocked. See [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap). |
+| `SesSenderEmail` | `""` | Verified SES sending identity used to email each user directly at 75%/100% of their personal cap. Leave `""` to disable per-user emails (the admin SNS alert on `AlertTopic` is unaffected either way). See [Prerequisites](#prerequisites) for SES sandbox mode. |
 
 Model pricing is **not** a CloudFormation parameter — it's `model-pricing.json`
 (repo root), uploaded by `deploy.sh` to the staging S3 bucket (`StagingBucketName`)
@@ -445,6 +467,9 @@ exempt service account's spend separately, the DynamoDB table and Logs
 Insights query results are still the source for that — exemption only
 skips the block, not the accounting.
 
+Exempt users also never receive the 75%/100% per-user SES emails, for the
+same reason they're never blocked.
+
 ## Removing the block for one individual user
 
 Deleting the DynamoDB row alone isn't durable if the user is still
@@ -500,6 +525,14 @@ how they're usually used:
   [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)) are
   silent — check the DynamoDB table or CloudWatch Logs if you need to
   confirm one happened, no email is sent for it.
+- **Per-user SES emails** (if `SesSenderEmail` is set) — sent directly to
+  the affected user (not the admin) at the 75% warning threshold and at
+  the moment they're newly blocked, once each per calendar month (tracked
+  via the `warnedAt`/`blockedAt` DynamoDB fields). These are separate
+  from, and in addition to, the batched admin SNS alert above. Exempt
+  usernames (and any non-email service-account username) never receive
+  these, since they fail the email-format check / are skipped by the same
+  exemption logic that skips blocking them.
 - **CloudWatch Logs** for the Lambdas themselves:
   `/aws/lambda/bedrock-budget-hardstop-enforcer` and
   `/aws/lambda/bedrock-budget-hardstop-reset` — check here first for any
@@ -518,6 +551,7 @@ how they're usually used:
   | `exempt` | Mirrors `ExemptUsernames` membership. |
   | `blocked` | Currently blocked. |
   | `blockedAt` / `costAtBlock` | Set once, when first blocked; not overwritten on later runs. |
+  | `warnedAt` | Set once, the first time this user's usage crosses 75% of their effective cap in a calendar month; not overwritten on later runs, so the 75%-threshold warning email is only ever sent once per user per month. |
 
   Scan sorted by spend, highest first (piped through `python3` since
   DynamoDB's raw JSON keeps numbers as strings, so a JMESPath `sort_by`
@@ -625,6 +659,20 @@ one UTC day, read-only. Useful for validating `model-pricing.json` changes
   (`<role-id>:<session-name>`, which only exists for assumed-role sessions)
   reaches them. If anyone has Bedrock access outside this permission set,
   this system can't cap them.
+- **Per-user warning/block emails are best-effort, and don't re-trigger on
+  a lowered cap.** If a user's `capUsd` is edited downward mid-month
+  *after* they already received the 75% warning email at the old
+  (higher) cap, they will not be re-warned even though they're now
+  closer to (or over) the new, lower threshold — `warnedAt` is set once
+  per calendar month and is not cleared by a `capUsd` edit. The block
+  email and the actual Deny enforcement are unaffected by this — only
+  the warning email can be skipped in this specific sequence. Also, SES
+  delivery itself is best-effort: a send failure (sandbox restriction,
+  unverified recipient, throttling) is caught and logged, never blocks
+  DynamoDB writes or the permission-set Deny rewrite, but also means a
+  user is not guaranteed to actually receive either email — treat the
+  admin SNS alert and the DynamoDB table as the authoritative record of
+  who's blocked, not the user's inbox.
 
 ## Troubleshooting
 
