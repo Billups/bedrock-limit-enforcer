@@ -53,6 +53,9 @@
 #   - Resolves each user's cap from budget-config.json (tier caps and
 #     user->tier assignments, read from S3 every run) plus any temporary
 #     bonusUsd on their DynamoDB item, which the monthly reset clears.
+#   - Optional teams (also budget-config.json): when a team's combined spend
+#     reaches its cap, all its members are blocked too, unless a member has
+#     teamBypass set on their DynamoDB item (also cleared monthly).
 #   - Self-healing: every run compares the desired blocked-user set against
 #     what's ACTUALLY in the permission set's policy right now, and only
 #     writes+provisions when they differ - so a run that updates DynamoDB but
