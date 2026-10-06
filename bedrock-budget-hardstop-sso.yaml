@@ -57,6 +57,9 @@
 #     next cycle instead of silently drifting.
 #   - On day 1 of each month, a second Lambda clears the DynamoDB blocklist
 #     and removes the Deny statement from the permission set.
+#   - Also emails each affected user directly via SES (if SesSenderEmail is
+#     set) at 75% of their cap and the moment they're newly blocked, in
+#     addition to the batched admin SNS alert.
 #
 # PREREQUISITES (do these BEFORE deploying this stack):
 #   - Enable "Model invocation logging" in Bedrock, pointing to a CloudWatch
@@ -157,6 +160,19 @@ Parameters:
       skips adding these to the blocklist and proactively removes them if
       they're already on it (self-healing, same as the pricing/policy
       checks). Leave empty ("") if there's nothing to exempt.
+
+  SesSenderEmail:
+    Type: String
+    Default: ""
+    Description: >
+      (Optional) verified SES sending identity (email address or domain
+      identity's address) used to send per-user budget warning/block
+      emails directly to each user. Leave empty ("") to disable per-user
+      emails entirely -- the batched admin SNS alert on AlertTopic still
+      works regardless. Must be a verified SES identity in this
+      account/region; if the account is still in the SES sandbox, sends
+      to unverified recipient addresses fail (caught and logged by the
+      enforcer, does not block enforcement) -- see README Prerequisites.
 
   StagingBucketName:
     Type: String
@@ -284,6 +300,15 @@ Resources:
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Ref AlertTopic
+        - PolicyName: SendUserEmails
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
         - PolicyName: Logging
           PolicyDocument:
             Version: "2012-10-17"
@@ -315,6 +340,7 @@ Resources:
           MODEL_PRICING_KEY: model-pricing.json
           ALERT_TOPIC_ARN: !Ref AlertTopic
           EXEMPT_USERNAMES: !Ref ExemptUsernames
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
           DENY_SID: BedrockBudgetHardStopPerUser
       # Local path -- `aws cloudformation package` zips this directory,
       # uploads it to the staging S3 bucket, and rewrites this property to
