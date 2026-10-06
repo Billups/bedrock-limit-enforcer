@@ -27,6 +27,7 @@ Stack name used in this doc: `bedrock-budget-hardstop`. Template file:
 - [Whitelisting a user (exempting them from the cap)](#whitelisting-a-user-exempting-them-from-the-cap)
 - [Removing the block for one individual user](#removing-the-block-for-one-individual-user)
 - [Monitoring](#monitoring)
+- [Admin script](#admin-script)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
 - [Tearing it down](#tearing-it-down)
@@ -422,7 +423,7 @@ in the same `budget-config.json`:
 
 | Situation | Do this | Lasts |
 |---|---|---|
-| One member needs to keep working, and is still under their own cap | Set `teamBypass` on their item (below) | Until the monthly reset; they're back on the team on the 1st |
+| One member needs to keep working, and is still under their own cap | Set `teamBypass` on their item (`budget_admin.py bypass <user>`, or the command below) | Until the monthly reset; they're back on the team on the 1st |
 | One member needs to keep working, and is also over their own cap | Set `teamBypass` **and** a `bonusUsd` on their item | Until the monthly reset |
 | The whole team needs more | Raise the team's `monthlyCapUsd` in `budget-config.json` and run `./deploy.sh` | Permanent (it's the config). Next run unblocks every member except anyone over their own cap |
 | Someone should leave the team for good | Remove them from `members` in `budget-config.json` | Permanent |
@@ -638,7 +639,8 @@ how they're usually used:
    ```
 
 2. **Give them extra budget for this month (not unlimited)** — set
-   `bonusUsd` on their item. It's added on top of their tier's cap (e.g.
+   `bonusUsd` on their item (or `python3 scripts/budget_admin.py topup <user> <amount> --now`,
+   see [Admin script](#admin-script)). It's added on top of their tier's cap (e.g.
    `50` on a $150 tier = $200 this month), and creates the row if they
    don't have one yet:
    ```bash
@@ -753,6 +755,37 @@ for r in rows:
   ```
   Look for a statement with `"Sid": "BedrockBudgetHardStopPerUser"` and
   check its `Condition.StringLike.aws:userid` list.
+
+## Admin script
+
+`scripts/budget_admin.py` covers this month's exceptions (`bonusUsd`,
+`teamBypass`) and a status view, so you don't have to hand-type the
+`aws dynamodb update-item` commands shown elsewhere in this README (those
+still work as a fallback):
+
+```bash
+python3 scripts/budget_admin.py status                       # teams + users, highest spend first
+python3 scripts/budget_admin.py status --team data-science
+python3 scripts/budget_admin.py topup ana@billups.com 50         # +$50 this month (adds to any existing bonus)
+python3 scripts/budget_admin.py topup ana@billups.com 200 --set  # bonus becomes exactly $200
+python3 scripts/budget_admin.py clear-topup ana@billups.com
+python3 scripts/budget_admin.py bypass ana@billups.com           # off their team's cap this month
+python3 scripts/budget_admin.py bypass ana@billups.com --off
+```
+
+- Add `--now` to `topup` / `clear-topup` / `bypass` to invoke the enforcer
+  immediately and print who got unblocked, instead of waiting for the next
+  scheduled run.
+- The username is matched case-insensitively against existing items, and
+  the write goes to the existing item's exact key. The enforcer only reads
+  the exact session-name casing, so a top-up written under a different
+  casing would otherwise be silently ignored. For someone with no usage yet
+  it writes the name as typed and warns you.
+- `bypass` checks team membership against the local `budget-config.json`
+  (`--config` to point elsewhere) and refuses if the user isn't in a team.
+- Needs an AWS profile with DynamoDB read/write on the table (and
+  `lambda:InvokeFunction` for `--now`). The shared `bedrock-limited-access`
+  role doesn't have these.
 
 ## Ad-hoc usage report
 
