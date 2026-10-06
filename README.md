@@ -89,12 +89,14 @@ Pipeline, run on a schedule (every 15 minutes by default):
 
 1. **Read.** Query CloudWatch Logs Insights over the Bedrock invocation log
    group for the current calendar month, grouped by `identity.arn` and
-   `modelId`, summing input/output token counts.
+   `modelId`, summing input, output, cache-write, and cache-read token
+   counts.
 2. **Attribute.** Extract the username from each `identity.arn`'s
    `RoleSessionName` (the part after `assumed-role/<role>/`).
 3. **Price.** Convert each user's token totals to USD using a per-model
-   price table (`ModelPricingJson`), summed across all models they used
-   this month.
+   price table fetched from S3 each run, summed across all models they used
+   this month. Cache-write is priced at the 5-minute TTL rate — see
+   [Model pricing table](#model-pricing-table) for why.
 4. **Exempt.** Skip anyone in `ExemptUsernames` entirely (see
    [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)), and
    proactively unblock them if they're already blocked.
@@ -132,7 +134,7 @@ gets `AccessDeniedException` on every `sso:*` call otherwise. See
 
 | Resource | Purpose |
 |---|---|
-| `BlockedUsersTable` (DynamoDB) | Source of truth for who's currently blocked this month. |
+| `BlockedUsersTable` (DynamoDB) | Live per-user usage ledger for the current month (everyone the enforcer has seen, not just blocked users) and source of truth for who's currently blocked. |
 | `AlertTopic` (SNS) + email subscription | Notifies on new blocks, monthly reset, and models missing a price entry. |
 | `EnforcerFunctionRole` (IAM Role) | Lets the enforcer read Bedrock logs, manage the permission set's inline policy via `sso:*`, and read/write the DynamoDB table. |
 | `EnforcerFunction` (Lambda, Python 3.12) | Runs the read → attribute → price → exempt → enforce → self-heal loop. |
@@ -237,36 +239,27 @@ only need `--parameter-overrides` when you want to change one.
 | `BedrockLogGroupName` | `/aws/bedrock/invocations` | Must match what Bedrock is actually configured to log to. |
 | `MonthlyCapUSD` | `150` | Cap per user, per calendar month. |
 | `EvaluationRateMinutes` | `15` | How often the enforcer runs. Lower = faster blocking, more Logs Insights scan cost. |
-| `ModelPricingJson` | 29 keys covering 13 models, `us-west-2`, Geo/In-region Cross-region Inference tier for most models (Global CRIS tier for Opus 4.6 v1's `global.`-prefixed shapes — see [Model pricing table](#model-pricing-table)); confirmed 2026-09-17 | **Must** use the exact `modelId` string as it appears in the logs — see [Known limitations](#known-limitations). |
 | `AlertEmail` | `oscar.gutierrez@billups.com` | Set to `""` to skip the email subscription. |
 | `ExemptUsernames` | `audrai_ai_agent` | Comma-separated usernames/session-names that are never blocked. See [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap). |
 
+Model pricing is **not** a CloudFormation parameter — it's `model-pricing.json`
+(repo root), uploaded by `deploy.sh` to the staging S3 bucket (`StagingBucketName`)
+after every deploy. The enforcer reads it from S3 fresh on every run, so editing the file + re-running
+`deploy.sh` updates pricing without a Lambda code change. See
+[Model pricing table](#model-pricing-table).
+
 ## Model pricing table
 
-`ModelPricingJson` prices are USD per **1,000 tokens** (note: AWS's own
-pricing pages quote per **1,000,000** tokens — divide by 1000 when copying
-from there). Bedrock logs the same model under up to three different
-`modelId` shapes depending on the call path (bare model ID, full
-inference-profile ARN, or the short `us.`-prefixed form), and the price
-lookup is exact-match — so every shape actually seen in this account's logs
-is included as its own key, all priced identically per model:
-
-| Model | Input (per 1K) | Output (per 1K) | Logged `modelId` shapes present |
-|---|---|---|---|
-| Claude Opus 5 | $0.0055 | $0.0275 | bare, ARN |
-| Claude Sonnet 5 | $0.0022 | $0.011 | bare, ARN |
-| Claude Opus 4.8 | $0.0055 | $0.0275 | bare, ARN |
-| Claude Opus 4.7 | $0.0055 | $0.0275 | bare, ARN |
-| Claude Opus 4.6 (v1) | $0.0055 | $0.0275 | bare, ARN (Geo/In-region tier, `us.` shapes) |
-| Claude Opus 4.6 (v1), Global CRIS | $0.005 | $0.025 | bare, ARN (`global.`-prefixed shapes only) |
-| Claude Sonnet 4.6 | $0.0033 | $0.0165 | bare, ARN, `us.` short |
-| Claude Sonnet 4.5 (`20250929-v1:0`) | $0.0033 | $0.0165 | bare, ARN, `us.` short |
-| Claude Haiku 4.5 (`20251001-v1:0`) | $0.0011 | $0.0055 | bare, ARN |
-| Claude Opus 4.5 (`20251101-v1:0`) | $0.0055 | $0.0275 | bare, ARN |
-| Claude Sonnet 4 (`20250514-v1:0`) | $0.003 | $0.015 | bare only |
-| Claude Opus 4.1 (`20250805-v1:0`) | $0.015 | $0.075 | bare, ARN |
-| Claude Fable 5.1 | $0.011 | $0.055 | bare, ARN, `us.` short |
-| GPT-5.6 Luna (OpenAI) | $0.00022 | $0.00132 | bare only |
+Prices live in `model-pricing.json` (repo root) — USD per **1,000 tokens**
+(AWS's own pricing pages quote per **1,000,000** — divide by 1000 when
+copying from there). The lookup key is the logged `modelId` with any
+`arn:aws:bedrock:...:inference-profile/` prefix stripped — i.e. matched on
+the substring after the last `/`, so a full inference-profile ARN and its
+bare model/profile-id equivalent share one entry instead of needing a
+duplicate. Still an exact-match lookup on that trailing segment (see
+[Known limitations](#known-limitations)) — just no longer tied to a
+specific account ID or region baked into an ARN. Each model entry has
+`input`, `output`, `cacheRead`, `cacheWrite5m`, and `cacheWrite1h` rates.
 
 Sourcing notes:
 
@@ -279,8 +272,7 @@ Sourcing notes:
   being called through *both* tiers in this account's logs (`global.`-
   prefixed `modelId` shapes as well as the `us.`-prefixed ones), so its two
   `global.`-prefixed keys are intentionally priced at the Global tier
-  instead — that's the source of the 29-vs-27-key/two-price-rows split
-  above.
+  instead — see its `global.`-prefixed entries in `model-pricing.json`.
 - GPT-5.6 Luna's price came from its dedicated model-card page
   (`docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-56-luna.html`),
   since it isn't in the main pricing page's summary table. Its logged
@@ -291,7 +283,11 @@ Sourcing notes:
 - If a model shows up in the logs with a shape not listed above (e.g. a
   bare model ID for a model that's only ever been seen via ARN, or a brand
   new model), add it as a new key with the same price as its sibling
-  shapes — see [Modifying and redeploying](#modifying-and-redeploying).
+  shapes — see [Modifying and redeploying](#modifying-and-redeploying). If
+  the new shape is a full inference-profile ARN, key it by just the
+  substring after the last `/` (e.g. `us.anthropic.claude-...`), not the
+  whole ARN — the lookup strips the ARN prefix before matching, so a
+  full-ARN key would just be dead weight.
 
 ## Deploying
 
@@ -379,10 +375,10 @@ relying on it:
    fields modelId | stats count() as invocations by modelId | sort invocations desc
    ```
    in CloudWatch Logs Insights on `/aws/bedrock/invocations`. Compare every
-   string against the keys in `ModelPricingJson`. The lookup is exact-match;
-   a mismatch silently prices that model's usage at $0 and it will never
-   trigger the cap, with no error anywhere except the "models missing a
-   price entry" SNS alert.
+   string against the keys in `model-pricing.json`. The lookup is
+   exact-match; a mismatch silently prices that model's usage at $0 and it
+   will never trigger the cap, with no error anywhere except the "models
+   missing a price entry" SNS alert.
 
 ## Modifying and redeploying
 
@@ -394,13 +390,17 @@ against the live stack and only updates what changed. Common edits:
   `--parameter-overrides MonthlyCapUSD=<value>` without editing the file
   (remember: pass it explicitly on `deploy`, editing the `Default` alone
   isn't picked up for an existing stack).
-- **Add a new model:** add an entry to the `ModelPricingJson` default (or
-  override it wholesale via `--parameter-overrides`). Get the price from
-  <https://aws.amazon.com/bedrock/pricing/> (select the provider, pick
-  region `us-west-2`, use the **Geo and In-region Cross-region Inference**
-  tier for Anthropic models) and the exact `modelId` from a Logs Insights
-  query as described above — never guess either one. Divide the page's
-  per-1M price by 1000 to get the per-1K value this template expects.
+- **Add a new model:** add an entry to `model-pricing.json` and re-run
+  `./deploy.sh` (uploads the updated file to S3 — no CloudFormation change
+  needed). Get the price from <https://aws.amazon.com/bedrock/pricing/>
+  (select the provider, pick region `us-west-2`, use the **Geo and
+  In-region Cross-region Inference** tier for Anthropic models) and the
+  exact `modelId` from a Logs Insights query as described above — never
+  guess either one. If the logged shape is a full inference-profile ARN,
+  key the entry by just the substring after the last `/` (see
+  [Model pricing table](#model-pricing-table)), not the whole ARN. Divide
+  the page's per-1M price by 1000 to get the per-1K value this file
+  expects.
 - **Change how often it checks:** edit `EvaluationRateMinutes`. Lower
   values catch overages faster but scan more data per run (see
   [Known limitations](#known-limitations) on cost).
@@ -447,57 +447,55 @@ skips the block, not the accounting.
 
 ## Removing the block for one individual user
 
-There's an important distinction here: **deleting the DynamoDB entry alone
-is not durable** if the user is still genuinely over the monthly cap. The
-enforcer recomputes cost from the logs every `EvaluationRateMinutes` and
-will re-block them the very next cycle if their month-to-date spend is
-still ≥ `MonthlyCapUSD`. Manually deleting the row only helps for a user who
-was blocked based on stale/incorrect data (e.g. a test run, or a pricing
-bug that's since been fixed) and is genuinely under the cap once
-recalculated.
+Deleting the DynamoDB row alone isn't durable if the user is still
+genuinely over their cap — the enforcer recomputes cost from the logs every
+`EvaluationRateMinutes` and re-blocks them next cycle. Options, in order of
+how they're usually used:
 
-Your real options, in order of how they're usually used:
-
-1. **They're actually under the cap now** (a pricing bug was fixed, or this
-   was a test block) — delete the DynamoDB row, and the self-healing check
-   removes the Deny statement on the next run (or force it immediately):
+1. **Stale/test block, they're actually under the cap** — delete the row,
+   then re-invoke to confirm:
    ```bash
    aws dynamodb delete-item \
      --table-name bedrock-budget-hardstop-blocked-users \
      --key '{"username": {"S": "<their-username-or-email>"}}' \
      --region us-west-2
 
-   aws lambda invoke \
-     --function-name bedrock-budget-hardstop-enforcer \
-     --region us-west-2 \
-     /tmp/out.json && cat /tmp/out.json
+   aws lambda invoke --function-name bedrock-budget-hardstop-enforcer \
+     --region us-west-2 /tmp/out.json && cat /tmp/out.json
    ```
-   Check the response's `total_blocked` list no longer includes them.
 
-2. **They're genuinely over budget but need access restored anyway before
-   month-end** — add them to `ExemptUsernames` and redeploy (see
-   [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)). This
-   is a policy decision (you're choosing to let them exceed the cap), so
-   treat it deliberately — e.g. remove them from `ExemptUsernames` again at
-   the start of the next month once you've decided how to handle it going
-   forward.
+2. **Give them a higher personal cap (not unlimited)** — edit `capUsd` on
+   their item; it's preserved across runs instead of resetting to
+   `MonthlyCapUSD`, and creates the row if they don't have one yet:
+   ```bash
+   aws dynamodb update-item \
+     --table-name bedrock-budget-hardstop-blocked-users \
+     --key '{"username": {"S": "<their-username-or-email>"}}' \
+     --update-expression "SET capUsd = :c" \
+     --expression-attribute-values '{":c": {"S": "300"}}' \
+     --region us-west-2
 
-3. **Wait for the monthly reset** — happens automatically at 00:05 UTC on
-   the 1st of the month; no action needed.
+   aws lambda invoke --function-name bedrock-budget-hardstop-enforcer \
+     --region us-west-2 /tmp/out.json
+   ```
+   Revert by setting `capUsd` back or deleting the row — it does not
+   auto-revert until the monthly reset clears the whole table.
 
-4. **Raise `MonthlyCapUSD`** — a global change (affects every user, not
-   just this one), only appropriate if the $150 cap itself needs revisiting.
+3. **Give them unlimited access before month-end** — add to
+   `ExemptUsernames` and redeploy (see
+   [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)).
 
-There is no per-user cap override in this template — options 2 and 4 are
-the only ways to change enforcement for less than "everyone" or "wait for
-reset."
+4. **Wait for the monthly reset** — 00:05 UTC on the 1st.
+
+5. **Raise `MonthlyCapUSD`** — global, affects every user without a
+   personal `capUsd` override.
 
 ## Monitoring
 
 - **SNS (`AlertTopic`)** — one email when new users get blocked (with the
   cost that tripped it), one on the monthly reset, and one if any `modelId`
   shows up in the logs with no matching price entry (meaning its cost isn't
-  being counted at all — treat this as a "fix `ModelPricingJson` now"
+  being counted at all — treat this as a "fix `model-pricing.json` now"
   alert). Note: exempt-user auto-unblocks (see
   [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)) are
   silent — check the DynamoDB table or CloudWatch Logs if you need to
@@ -507,9 +505,40 @@ reset."
   `/aws/lambda/bedrock-budget-hardstop-reset` — check here first for any
   runtime error (`sso:*` permission issues, Logs Insights query failures,
   provisioning timeouts, etc.).
-- **DynamoDB table `bedrock-budget-hardstop-blocked-users`** — the live
-  list of who's blocked this month and what they were spending when it
-  happened (`costAtBlock`).
+- **DynamoDB table `bedrock-budget-hardstop-blocked-users`** — live
+  per-user usage ledger, refreshed every `EvaluationRateMinutes`, not just
+  who's blocked. No item for a user means $0 usage this month. Schema:
+
+  | Attribute | Meaning |
+  |---|---|
+  | `username` | Partition key. |
+  | `currentUsageUsd` | Month-to-date cost as of `lastUpdated`. |
+  | `capUsd` | Effective cap for this user. Defaults to `MonthlyCapUSD`, then preserved once set — edit directly for a per-user cap (see [Removing the block for one individual user](#removing-the-block-for-one-individual-user)). |
+  | `lastUpdated` | ISO timestamp of the last run that saw usage for this user. |
+  | `exempt` | Mirrors `ExemptUsernames` membership. |
+  | `blocked` | Currently blocked. |
+  | `blockedAt` / `costAtBlock` | Set once, when first blocked; not overwritten on later runs. |
+
+  Scan sorted by spend, highest first (piped through `python3` since
+  DynamoDB's raw JSON keeps numbers as strings, so a JMESPath `sort_by`
+  would sort them lexically, not numerically):
+  ```bash
+  aws dynamodb scan \
+    --table-name bedrock-budget-hardstop-blocked-users \
+    --region us-west-2 \
+    --projection-expression "username, currentUsageUsd, capUsd, blocked, exempt" \
+    --output json \
+  | python3 -c '
+import json, sys
+items = json.load(sys.stdin)["Items"]
+rows = [{k: list(v.values())[0] for k, v in i.items()} for i in items]
+rows.sort(key=lambda r: float(r["currentUsageUsd"]), reverse=True)
+for r in rows:
+    usage, cap, user = r["currentUsageUsd"], r["capUsd"], r["username"]
+    blocked, exempt = r.get("blocked", False), r.get("exempt", False)
+    print(f"{usage:>8} / {cap:<6} blocked={blocked!s:<5} exempt={exempt!s:<5} {user}")
+'
+  ```
 - **Permission set's actual inline policy**, as the ground truth for what's
   really enforced right now:
   ```bash
@@ -521,6 +550,22 @@ reset."
   Look for a statement with `"Sid": "BedrockBudgetHardStopPerUser"` and
   check its `Condition.StringLike.aws:userid` list.
 
+## Ad-hoc usage report
+
+The enforcer only ever reports month-to-date totals. For a one-off question
+like "what did a user actually cost on a specific day" (e.g. reconciling
+against a billing SKU doIT flagged), use `scripts/usage_report.py` instead
+of waiting on/trusting the running totals:
+
+```bash
+python3 scripts/usage_report.py 2026-09-29
+python3 scripts/usage_report.py 2026-09-29 --user jdoe
+```
+
+Same Logs Insights query shape and pricing logic as the enforcer, scoped to
+one UTC day, read-only. Useful for validating `model-pricing.json` changes
+(e.g. the cache-write TTL assumption) against real billed amounts.
+
 ## Known limitations
 
 - **Not instantaneous.** Enforcement runs on a schedule (every
@@ -529,11 +574,22 @@ reset."
   top of that. A user can overshoot the cap by a small amount before the
   Deny actually lands. Lower `EvaluationRateMinutes` to shrink this window;
   it can't be reduced to zero with this architecture.
-- **Exact-match pricing.** `ModelPricingJson` keys must match the logged
-  `modelId` string byte-for-byte, including any cross-region-inference
-  prefix or ARN form. A mismatch fails silently (that model's usage is
-  priced at $0, never counted, never blocked) — the only guardrail is the
-  "models missing a price entry" SNS alert, so don't ignore it.
+- **Exact-match pricing.** The enforcer strips any
+  `arn:aws:bedrock:...:inference-profile/` prefix off the logged `modelId`
+  (matching on the substring after the last `/`) before looking it up, so
+  a full inference-profile ARN and its bare model/profile-id equivalent
+  share one `model-pricing.json` entry, and pricing no longer depends on
+  the account ID/region baked into that ARN. It's still an exact-match
+  lookup on that trailing segment, though — any other mismatch (a renamed
+  model, an unexpected cross-region-inference prefix) fails silently
+  (that model's usage is priced at $0, never counted, never blocked) — the
+  only guardrail is the "models missing a price entry" SNS alert, so don't
+  ignore it.
+- **Cache-write TTL ambiguity.** The invocation log's
+  `cacheWriteInputTokenCount` doesn't distinguish a 5-minute from a 1-hour
+  cache write, so the enforcer prices all of it at the 5-minute rate (the
+  API default). Any 1-hour-TTL usage is undercounted by the gap between the
+  two rates — see [Model pricing table](#model-pricing-table).
 - **Doesn't cover every Bedrock billing path.** This only prices
   `bedrock:InvokeModel`/`InvokeModelWithResponseStream`/`Converse`/
   `ConverseStream` calls seen in invocation logging. Confirmed out of scope
@@ -559,6 +615,16 @@ reset."
   resets can't happen) until someone notices via the Lambda error logs.
 - **CloudFormation doesn't know about the Deny statement.** See
   [Tearing it down](#tearing-it-down).
+- **Only enforces on the shared permission set.** The Deny statement is
+  written into the `bedrock-limited-access` permission set, so it only
+  affects sessions that assume that role. A standalone IAM user/role with
+  its own Bedrock grant is invisible to enforcement — their usage still gets
+  tracked (via the `:user/` ARN fallback in `extract_username`) and they can
+  still be marked `blocked` in DynamoDB, but that block has no real effect,
+  since neither the policy attachment nor the `aws:userid` condition
+  (`<role-id>:<session-name>`, which only exists for assumed-role sessions)
+  reaches them. If anyone has Bedrock access outside this permission set,
+  this system can't cap them.
 
 ## Troubleshooting
 
@@ -579,7 +645,7 @@ template file. Always pass the changed parameter explicitly:
 **A user isn't getting blocked despite being over cap**
 Check the enforcer's CloudWatch Logs for the run in question, and look at
 its return value's `unpriced_models` field — if their `modelId` isn't in
-`ModelPricingJson` (or shows up with an unexpected prefix/ARN shape), their
+`model-pricing.json` (or shows up with an unexpected prefix/ARN shape), their
 usage is being priced at $0 and never trips the cap.
 
 **Need to manually unblock someone before the monthly reset**
