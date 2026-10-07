@@ -5,6 +5,8 @@
   "anthropic.claude-opus-5": {"input": 0.0055, "output": 0.0275, "cacheWrite5m": 0.006875, "cacheWrite1h": 0.011, "cacheRead": 0.00055},
   "us.anthropic.claude-opus-5": {"input": 0.0055, "output": 0.0275, "cacheWrite5m": 0.006875, "cacheWrite1h": 0.011, "cacheRead": 0.00055},
   "global.anthropic.claude-opus-5": {"input": 0.005, "output": 0.025, "cacheWrite5m": 0.00625, "cacheWrite1h": 0.01, "cacheRead": 0.0005},
+  "global.anthropic.claude-sonnet-5-5": {"input": 0.002, "output": 0.01, "cacheWrite5m": 0.0025, "cacheWrite1h": 0.004, "cacheRead": 0.0002},
+  "us.anthropic.claude-sonnet-5-5": {"input": 0.0022, "output": 0.011, "cacheWrite5m": 0.00275, "cacheWrite1h": 0.0044, "cacheRead": 0.00022},
   "anthropic.claude-sonnet-5": {"input": 0.0022, "output": 0.011, "cacheWrite5m": 0.00275, "cacheWrite1h": 0.0044, "cacheRead": 0.00022},
   "us.anthropic.claude-sonnet-5": {"input": 0.0022, "output": 0.011, "cacheWrite5m": 0.00275, "cacheWrite1h": 0.0044, "cacheRead": 0.00022},
   "global.anthropic.claude-sonnet-5": {"input": 0.002, "output": 0.01, "cacheWrite5m": 0.0025, "cacheWrite1h": 0.004, "cacheRead": 0.0002},
