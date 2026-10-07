@@ -7,8 +7,8 @@
 #
 # Examples:
 #   ./deploy.sh
-#   ./deploy.sh -- MonthlyCapUSD=150 ExemptUsernames="audrai_ai_agent"
-#   ./deploy.sh my-other-staging-bucket -- MonthlyCapUSD=150
+#   ./deploy.sh -- ExemptUsernames="audrai_ai_agent"
+#   ./deploy.sh my-other-staging-bucket -- EvaluationRateMinutes=15
 #
 # Requires: AWS CLI configured (AWS_PROFILE / --profile), region us-west-2.
 # The staging bucket just needs to be any bucket in the same account/region
@@ -24,6 +24,8 @@ TEMPLATE="bedrock-budget-hardstop-sso.yaml"
 PACKAGED="packaged.yaml"
 PRICING_FILE="model-pricing.json"
 PRICING_KEY="model-pricing.json"
+BUDGET_CONFIG_FILE="budget-config.json"
+BUDGET_CONFIG_KEY="budget-config.json"
 
 BUCKET="bedrock-budget-hardstop-396026123718"
 if [[ "${1:-}" != "" && "${1}" != "--" ]]; then
@@ -42,6 +44,12 @@ PARAM_OVERRIDES=("StagingBucketName=${BUCKET}" "$@")
 echo "==> Validating model pricing JSON"
 python3 -c "import json; json.load(open('${PRICING_FILE}'))"
 
+echo "==> Validating budget config"
+# Same validation the enforcer runs on every load. It can't check for
+# overlap with ExemptUsernames here (that's a stack parameter) -- the
+# enforcer does that at runtime and stops with an SNS alert if it finds one.
+python3 src/enforcer/budget_config.py "${BUDGET_CONFIG_FILE}"
+
 echo "==> Validating template"
 aws cloudformation validate-template \
   --template-body "file://${TEMPLATE}" \
@@ -53,6 +61,12 @@ aws cloudformation package \
   --s3-bucket "${BUCKET}" \
   --output-template-file "${PACKAGED}" \
   --region "${REGION}"
+
+# Uploaded BEFORE the stack deploy (unlike the pricing table): the enforcer
+# stops every run if this object is missing, so it has to exist by the time
+# new enforcer code goes live. Older enforcer code just ignores it.
+echo "==> Uploading ${BUDGET_CONFIG_FILE} to s3://${BUCKET}/${BUDGET_CONFIG_KEY}"
+aws s3 cp "${BUDGET_CONFIG_FILE}" "s3://${BUCKET}/${BUDGET_CONFIG_KEY}" --region "${REGION}" > /dev/null
 
 echo "==> Deploying stack ${STACK_NAME}"
 aws cloudformation deploy \

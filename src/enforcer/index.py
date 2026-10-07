@@ -15,13 +15,19 @@ Runs on a schedule (every EvaluationRateMinutes, via EventBridge). Each run:
      cache writes, so 1-hour usage (if any) is undercounted -- see the
      project README for how to validate/adjust this.
   4. Skips/self-heals any username listed in EXEMPT_USERNAMES.
-  5. Upserts every evaluated user into DynamoDB with their current
-     month-to-date usage, whether they're exempt, and whether they're
-     blocked -- the table is a live usage ledger, not just a blocklist. Each
-     user's effective cap defaults to MONTHLY_CAP_USD, but if their existing
-     DynamoDB item already has a capUsd value, that value is preserved and
-     used instead, so a per-user override (set by hand, or by future tooling)
-     sticks across runs.
+  5. Resolves each user's effective cap from budget-config.json (fetched
+     from S3 every run, like the pricing table): the cap of the tier the
+     user is assigned to (or defaultTier), plus any bonusUsd on their
+     DynamoDB item. The tier is re-resolved on every run, so moving a user
+     to another tier takes effect on the next run in either direction --
+     including unblocking them if the new cap is above their spend.
+     bonusUsd is a temporary top-up (negative values lower the cap) that
+     only the monthly reset clears. An invalid or missing config stops the
+     run before anything is written (SNS alert + Lambda error), leaving the
+     current blocks exactly as they are. Every evaluated user's DynamoDB
+     item is updated with their month-to-date usage, tier, and effective
+     cap -- the table is a live usage ledger, not just a blocklist. capUsd
+     on the item is written for visibility only and never read back.
   6. Records anyone at or over their effective cap, then rewrites the IAM
      Identity Center permission set's inline policy so its Deny statement
      (Sid=DENY_SID) matches the full current blocklist. This is
@@ -30,8 +36,9 @@ Runs on a schedule (every EvaluationRateMinutes, via EventBridge). Each run:
      updated DynamoDB but crashed before provisioning gets corrected here
      automatically.
   7. Also emails the affected user directly via SES (if SES_SENDER_EMAIL is
-     set) -- once at WARN_THRESHOLD_FRACTION of their cap, and once the
-     moment they're newly blocked -- independent of the batched admin SNS
+     set) -- once at WARN_THRESHOLD_FRACTION of their cap (re-armed if the
+     cap changes), once the moment they're newly blocked, and once when a
+     cap increase unblocks them -- independent of the batched admin SNS
      alert above. A username that isn't a valid email (e.g. a service
      account) is silently skipped, and an SES failure is logged but never
      allowed to abort the run.
@@ -51,6 +58,8 @@ from datetime import datetime, timezone
 
 import boto3
 
+from budget_config import ConfigError, parse_config
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -66,9 +75,9 @@ LOG_GROUP = os.environ["BEDROCK_LOG_GROUP"]
 INSTANCE_ARN = os.environ["SSO_INSTANCE_ARN"]
 PERMISSION_SET_ARN = os.environ["PERMISSION_SET_ARN"]
 DENY_SID = os.environ.get("DENY_SID", "BedrockBudgetHardStopPerUser")
-CAP_USD = float(os.environ["MONTHLY_CAP_USD"])
 PRICING_BUCKET = os.environ["MODEL_PRICING_BUCKET"]
 PRICING_KEY = os.environ["MODEL_PRICING_KEY"]
+BUDGET_CONFIG_KEY = os.environ["BUDGET_CONFIG_KEY"]
 TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN")
 SES_SENDER_EMAIL = os.environ.get("SES_SENDER_EMAIL")
 EXEMPT_USERNAMES = {
@@ -85,7 +94,7 @@ DENIED_ACTIONS = [
 ]
 
 # Fixed by design, not a CFN parameter -- this is a notification-timing
-# detail nobody has asked to tune, unlike MONTHLY_CAP_USD.
+# detail nobody has asked to tune, unlike the tier caps.
 WARN_THRESHOLD_FRACTION = 0.75
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
@@ -273,9 +282,78 @@ def apply_blocklist(all_blocked):
     return True
 
 
+def load_budget_config():
+    """Fetches and validates budget-config.json. Any failure (missing
+    object, bad JSON, failed validation) alerts and re-raises, so the run
+    stops before touching DynamoDB or the permission set -- existing blocks
+    stay exactly as they are, and nobody new is blocked or unblocked until
+    the config is fixed."""
+    try:
+        raw = s3.get_object(Bucket=PRICING_BUCKET, Key=BUDGET_CONFIG_KEY)["Body"].read()
+        return parse_config(raw, EXEMPT_USERNAMES)
+    except Exception as e:
+        logger.exception("Could not load budget config")
+        if TOPIC_ARN:
+            sns.publish(
+                TopicArn=TOPIC_ARN,
+                Subject="Bedrock budget: enforcement stopped, invalid budget config",
+                Message=(
+                    f"s3://{PRICING_BUCKET}/{BUDGET_CONFIG_KEY} could not be "
+                    f"loaded, so this enforcement run was skipped entirely. "
+                    f"Current blocks are left in place; no one will be newly "
+                    f"blocked or unblocked until it's fixed.\n\n"
+                    f"{type(e).__name__}: {e}"
+                ),
+            )
+        raise
+
+
+def parse_bonus(username, existing):
+    """bonusUsd is hand-edited (or written by admin tooling), so it may be
+    stored as either a DynamoDB number or a string. An unparseable value is
+    treated as 0 -- the stricter outcome -- rather than failing the run."""
+    if "bonusUsd" not in existing:
+        return 0.0
+    try:
+        return float(existing["bonusUsd"])
+    except (TypeError, ValueError):
+        logger.warning("Ignoring unparseable bonusUsd %r for %s", existing["bonusUsd"], username)
+        return 0.0
+
+
+def update_user_item(username, sets, removes):
+    """Writes only the attributes the enforcer owns. An UpdateItem (not a
+    PutItem of the whole item) so a bonusUsd an admin sets between this
+    run's GetItem and this write can't be overwritten."""
+    names = {}
+    values = {}
+    set_parts = []
+    for i, (attr, value) in enumerate(sets.items()):
+        names[f"#s{i}"] = attr
+        values[f":s{i}"] = value
+        set_parts.append(f"#s{i} = :s{i}")
+    expr = "SET " + ", ".join(set_parts)
+    if removes:
+        remove_parts = []
+        for i, attr in enumerate(removes):
+            names[f"#r{i}"] = attr
+            remove_parts.append(f"#r{i}")
+        expr += " REMOVE " + ", ".join(remove_parts)
+    table.update_item(
+        Key={"username": username},
+        UpdateExpression=expr,
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+
+
 def lambda_handler(event, context):
     now_s = int(time.time())
     start_s = month_start_epoch_seconds()
+
+    # Loaded first so an invalid config stops the run before the (slow)
+    # Logs Insights query.
+    budget = load_budget_config()
 
     # Fetched fresh every run (not cached at module load) so a pricing edit
     # in S3 takes effect on the next scheduled run, no redeploy needed.
@@ -337,53 +415,71 @@ def lambda_handler(event, context):
     # live ledger of everyone's spend, not just a blocklist, so "who's close
     # to the cap" is a plain scan away. blockedAt/costAtBlock are preserved
     # from the first time a given user actually crossed the cap rather than
-    # being overwritten on every run. capUsd is likewise preserved once set:
-    # a per-user override in DDB (e.g. hand-edited to raise/lower one
-    # person's cap) sticks across runs instead of being reset back to the
-    # global MONTHLY_CAP_USD, which only applies to users with no override.
+    # being overwritten on every run. The effective cap is always recomputed
+    # from budget-config.json + bonusUsd; the capUsd written here is only a
+    # snapshot for whoever reads the table.
     now_iso = datetime.now(timezone.utc).isoformat()
     newly_blocked = []
     newly_warned = []
+    newly_unblocked = []
     for username, cost in cost_by_user.items():
         is_exempt = username in EXEMPT_USERNAMES
 
         existing = table.get_item(Key={"username": username}).get("Item") or {}
         was_blocked = bool(existing.get("blocked"))
-        was_warned = bool(existing.get("warnedAt"))
+        tier = budget.tier_for(username)
+        tier_cap = budget.tier_caps[tier]
+        effective_cap = tier_cap + parse_bonus(username, existing)
+        # The warning is tied to the cap it was sent against: if the cap
+        # changes (tier move, bonus), it re-arms. Items warned before
+        # warnedAtCapUsd existed are assumed to match, so deploying this
+        # doesn't re-send this month's warnings.
         try:
-            effective_cap = float(existing["capUsd"]) if "capUsd" in existing else CAP_USD
+            was_warned = bool(existing.get("warnedAt")) and (
+                "warnedAtCapUsd" not in existing
+                or float(existing["warnedAtCapUsd"]) == effective_cap
+            )
         except (TypeError, ValueError):
-            effective_cap = CAP_USD
+            was_warned = False
 
         should_block = (not is_exempt) and cost >= effective_cap
-        # Only warn on the way up to the cap -- a user who jumps straight
-        # from under 75% to over 100% in one evaluation cycle gets just the
-        # block email below, not a redundant warning first.
-        should_warn = (
+        is_unblocking = was_blocked and not should_block
+        over_warn_line = (
             (not is_exempt)
             and not should_block
-            and not was_blocked
-            and not was_warned
             and cost >= WARN_THRESHOLD_FRACTION * effective_cap
         )
+        # Only warn on the way up to the cap -- a user who jumps straight
+        # from under 75% to over 100% in one evaluation cycle gets just the
+        # block email below, not a redundant warning first. A user being
+        # unblocked into the warning zone gets the unblock email instead,
+        # which already states their usage against the new cap.
+        should_warn = over_warn_line and not was_warned and not is_unblocking
 
-        item = {
-            "username": username,
+        sets = {
             "currentUsageUsd": str(round(cost, 2)),
+            "tier": tier,
+            "tierCapUsd": str(tier_cap),
             "capUsd": str(effective_cap),
             "lastUpdated": now_iso,
             "exempt": is_exempt,
             "blocked": should_block,
         }
-        if should_block:
-            item["blockedAt"] = existing.get("blockedAt") if was_blocked else now_iso
-            item["costAtBlock"] = existing.get("costAtBlock") if was_blocked else str(round(cost, 2))
-        if was_warned:
-            item["warnedAt"] = existing["warnedAt"]
-        elif should_warn:
-            item["warnedAt"] = now_iso
+        removes = []
+        if should_block and not was_blocked:
+            sets["blockedAt"] = now_iso
+            sets["costAtBlock"] = str(round(cost, 2))
+        elif not should_block:
+            removes += ["blockedAt", "costAtBlock"]
+        if over_warn_line and not was_warned:
+            sets["warnedAt"] = now_iso
+            sets["warnedAtCapUsd"] = str(effective_cap)
+        elif not over_warn_line and not was_warned:
+            # Below the line for the current cap (or blocked/exempt): clear
+            # any warning sent against an older cap so it can fire again.
+            removes += ["warnedAt", "warnedAtCapUsd"]
 
-        table.put_item(Item=item)
+        update_user_item(username, sets, removes)
 
         if should_warn:
             newly_warned.append((username, cost, effective_cap))
@@ -402,7 +498,7 @@ def lambda_handler(event, context):
             )
 
         if should_block and not was_blocked:
-            newly_blocked.append((username, cost, effective_cap))
+            newly_blocked.append((username, cost, effective_cap, tier))
             send_user_email(
                 username,
                 subject="Bedrock access blocked: monthly budget reached",
@@ -415,6 +511,11 @@ def lambda_handler(event, context):
                     f"automatically on the 1st."
                 ),
             )
+
+        if is_unblocking and not is_exempt:
+            # Emailed only after apply_blocklist() succeeds below, so the
+            # email never arrives before the Deny is actually gone.
+            newly_unblocked.append((username, cost, effective_cap))
 
     # Self-heal: an exempt username should never stay blocked, even if it
     # got added before ExemptUsernames included it (or before this parameter
@@ -439,11 +540,27 @@ def lambda_handler(event, context):
 
     policy_changed = apply_blocklist(all_blocked)
 
+    for username, cost, effective_cap in newly_unblocked:
+        send_user_email(
+            username,
+            subject="Bedrock access restored",
+            body=(
+                f"Your Amazon Bedrock monthly cap has been raised to "
+                f"${effective_cap:.0f}, and your access has been restored. "
+                f"Your usage so far this month is ${cost:.2f}. If you reach "
+                f"the new cap, your access will be blocked again for the "
+                f"rest of the calendar month."
+            ),
+        )
+
     if newly_blocked and TOPIC_ARN:
-        lines = [f"- {u}: ${c:.2f} (cap ${cap:.0f})" for u, c, cap in newly_blocked]
+        lines = [
+            f"- {u}: ${c:.2f} (cap ${cap:.0f}, tier {tier})"
+            for u, c, cap, tier in newly_blocked
+        ]
         sns.publish(
             TopicArn=TOPIC_ARN,
-            Subject=f"Bedrock: users blocked (default cap ${CAP_USD:.0f}/month)",
+            Subject="Bedrock: users blocked",
             Message="Bedrock access was blocked for:\n" + "\n".join(lines),
         )
 
@@ -473,8 +590,9 @@ def lambda_handler(event, context):
 
     return {
         "evaluated_users": len(cost_by_user),
-        "newly_blocked": [u for u, _, _ in newly_blocked],
+        "newly_blocked": [u for u, _, _, _ in newly_blocked],
         "newly_warned": [u for u, _, _ in newly_warned],
+        "newly_unblocked": [u for u, _, _ in newly_unblocked],
         "newly_unblocked_exempt": newly_unblocked_exempt,
         "total_blocked": all_blocked,
         "permission_set_policy_updated": policy_changed,

@@ -1,7 +1,8 @@
 # Bedrock Per-User Budget Hard Stop (Shared SSO Permission Set)
 
-Caps Amazon Bedrock spend at **$150/user/month** and actually blocks access
-when a user crosses that cap — not just an email alert. Built for the case
+Caps Amazon Bedrock spend per user per month — by budget tier (e.g.
+**$70 / $150 / $300**, defined in `budget-config.json`) — and actually blocks access
+when a user crosses their cap — not just an email alert. Built for the case
 where every Bedrock user in the account assumes the **same** IAM Identity
 Center (SSO) permission set, so there's no per-person IAM identity to hang
 a budget on.
@@ -18,6 +19,7 @@ Stack name used in this doc: `bedrock-budget-hardstop`. Template file:
 - [Prerequisites](#prerequisites)
 - [Parameters reference](#parameters-reference)
 - [Model pricing table](#model-pricing-table)
+- [Budget tiers](#budget-tiers)
 - [Deploying](#deploying)
 - [Testing before you trust it](#testing-before-you-trust-it)
 - [Modifying and redeploying](#modifying-and-redeploying)
@@ -100,7 +102,10 @@ Pipeline, run on a schedule (every 15 minutes by default):
 4. **Exempt.** Skip anyone in `ExemptUsernames` entirely (see
    [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)), and
    proactively unblock them if they're already blocked.
-5. **Enforce.** Any non-exempt user at or over the monthly cap gets recorded
+5. **Enforce.** Each user's cap is their tier's cap from `budget-config.json`
+   plus any temporary `bonusUsd` on their DynamoDB item (see
+   [Budget tiers](#budget-tiers)), recomputed every run. Any non-exempt user
+   at or over their cap gets recorded
    in DynamoDB. The Lambda then rewrites the permission set's inline policy
    so its Deny statement's `aws:userid` condition matches `*:<username>` for
    every currently-blocked user. An explicit Deny always wins over the
@@ -113,8 +118,9 @@ Pipeline, run on a schedule (every 15 minutes by default):
    fails before provisioning (network blip, throttling, etc.): the next
    cycle corrects it automatically.
 7. **Reset.** On the 1st of each month, a second Lambda clears the blocked
-   list and removes the Deny statement, so last month's block doesn't carry
-   over.
+   list (and with it every `bonusUsd` top-up) and removes the Deny
+   statement, so last month's blocks and exceptions don't carry over —
+   everyone starts the month on their tier's cap.
 
 Why `aws:userid` and not a tag or a separate role: for an assumed-role
 session, `aws:userid` has the form `<role-unique-id>:<RoleSessionName>`.
@@ -258,7 +264,6 @@ only need `--parameter-overrides` when you want to change one.
 | `SSOInstanceArn` | `arn:aws:sso:::instance/ssoins-79072388697bbe8d` | IAM Identity Center instance ARN. |
 | `PermissionSetArn` | `arn:aws:sso:::permissionSet/ssoins-79072388697bbe8d/ps-7907c9a4bea503c7` | The `bedrock-limited-access` permission set whose inline policy gets rewritten. |
 | `BedrockLogGroupName` | `/aws/bedrock/invocations` | Must match what Bedrock is actually configured to log to. |
-| `MonthlyCapUSD` | `150` | Cap per user, per calendar month. |
 | `EvaluationRateMinutes` | `15` | How often the enforcer runs. Lower = faster blocking, more Logs Insights scan cost. |
 | `AlertEmail` | `oscar.gutierrez@billups.com` | Set to `""` to skip the email subscription. |
 | `ExemptUsernames` | `audrai_ai_agent` | Comma-separated usernames/session-names that are never blocked. See [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap). |
@@ -268,7 +273,10 @@ Model pricing is **not** a CloudFormation parameter — it's `model-pricing.json
 (repo root), uploaded by `deploy.sh` to the staging S3 bucket (`StagingBucketName`)
 after every deploy. The enforcer reads it from S3 fresh on every run, so editing the file + re-running
 `deploy.sh` updates pricing without a Lambda code change. See
-[Model pricing table](#model-pricing-table).
+[Model pricing table](#model-pricing-table). The per-user caps work the same
+way: they're `budget-config.json`, not a parameter (the old `MonthlyCapUSD`
+parameter was replaced by the config's `standard` tier) — see
+[Budget tiers](#budget-tiers).
 
 ## Model pricing table
 
@@ -311,6 +319,73 @@ Sourcing notes:
   whole ARN — the lookup strips the ARN prefix before matching, so a
   full-ARN key would just be dead weight.
 
+## Budget tiers
+
+Caps live in `budget-config.json` (repo root), uploaded by `deploy.sh` to the
+staging bucket next to `model-pricing.json` and read fresh by the enforcer
+every run:
+
+```json
+{
+  "defaultTier": "standard",
+  "tiers": {
+    "basic":    { "monthlyCapUsd": 70 },
+    "standard": { "monthlyCapUsd": 150 },
+    "power":    { "monthlyCapUsd": 300 }
+  },
+  "users": {
+    "someone@billups.com": { "tier": "power" }
+  }
+}
+```
+
+- Anyone not listed under `users` is on `defaultTier`.
+- Usernames are the session names that show up in the logs (usually the
+  person's email), matched case-insensitively.
+- Tiers are a map — add or rename one by editing the file; nothing in the
+  code knows the tier names.
+
+**The file is the permanent policy; DynamoDB only holds this month's
+exceptions.** Each user's effective cap is recomputed every run as:
+
+```
+cap = tiers[user's tier].monthlyCapUsd + bonusUsd (from their DynamoDB item, default 0)
+```
+
+| To… | Do this | Lasts |
+|---|---|---|
+| Move someone to another tier | Edit `users` in `budget-config.json`, run `./deploy.sh` | Until the file changes. Takes effect on the next run, in both directions — moving a blocked user to a tier above their spend unblocks them. |
+| Change a tier's cap | Edit `tiers` in `budget-config.json`, run `./deploy.sh` | Until the file changes. Affects everyone on that tier. |
+| Give one person extra budget this month | Set `bonusUsd` on their DynamoDB item (see [Removing the block for one individual user](#removing-the-block-for-one-individual-user)) | Until the monthly reset. |
+
+**Validation.** `deploy.sh` validates the file before uploading it, and the
+enforcer validates it again on every load: unknown keys, duplicate keys, a
+user listed twice (including differing only by case), an undefined tier, a
+non-positive cap, or a username that's also in `ExemptUsernames` are all
+errors. **An invalid or missing config stops the enforcer run entirely**
+before anything is written — an SNS alert ("enforcement stopped, invalid
+budget config") goes out and the Lambda errors (and is retried by
+EventBridge, so expect repeat alerts until it's fixed). Current blocks stay in
+place; nobody is newly blocked or unblocked until the file is fixed.
+
+**Migrating from per-user `capUsd` overrides.** Before tiers, a hand-edited
+`capUsd` on an item was a per-user override. The enforcer now ignores
+`capUsd` (it's written for display only), so existing overrides have to be
+converted to `bonusUsd` once, while the old enforcer is paused (it rewrites
+whole items and would erase the new attribute):
+
+```bash
+aws events disable-rule --name bedrock-budget-hardstop-enforcer-schedule --region us-west-2
+python3 scripts/migrate_cap_to_bonus.py            # dry run — review the output
+python3 scripts/migrate_cap_to_bonus.py --apply
+./deploy.sh
+aws events enable-rule --name bedrock-budget-hardstop-enforcer-schedule --region us-west-2
+```
+
+Items whose `capUsd` equals the old default (`--old-default`, 150) were
+never overrides and are skipped. Deploying right after a monthly reset makes
+this a no-op, since the reset deletes every item.
+
 ## Deploying
 
 The Lambda source lives in `src/enforcer/index.py` and `src/reset/index.py`,
@@ -342,8 +417,8 @@ name as the first argument only if that one is unavailable:
 `./deploy.sh my-other-staging-bucket`. Pass CloudFormation parameter
 overrides after `--`, with or without a custom bucket:
 ```bash
-./deploy.sh -- MonthlyCapUSD=150 ExemptUsernames="audrai_ai_agent"
-./deploy.sh my-other-staging-bucket -- MonthlyCapUSD=150
+./deploy.sh -- ExemptUsernames="audrai_ai_agent"
+./deploy.sh my-other-staging-bucket -- EvaluationRateMinutes=15
 ```
 
 Then check the inbox for `AlertEmail` for AWS's subscription confirmation
@@ -372,25 +447,33 @@ relying on it:
    With no real traffic yet, expect `"evaluated_users": 0` and no errors —
    that alone confirms the Logs Insights query and `sso:*` permissions work.
 
-2. **Force a real block.** Temporarily redeploy with a near-zero cap
-   (always pass it explicitly — `aws cloudformation deploy` keeps the
-   *previous* value for any parameter you don't pass, even if you changed
-   the template's `Default`):
+2. **Force a real block.** Give a test user a negative `bonusUsd` that
+   brings their cap to almost zero (no redeploy needed, and it only affects
+   that one user):
    ```bash
-   ./deploy.sh -- MonthlyCapUSD=1
+   aws dynamodb update-item \
+     --table-name bedrock-budget-hardstop-blocked-users \
+     --key '{"username": {"S": "<test-username>"}}' \
+     --update-expression "SET bonusUsd = :b" \
+     --expression-attribute-values '{":b": {"N": "-149.99"}}' \
+     --region us-west-2
    ```
-   Have a test user make one small Bedrock call, invoke the enforcer Lambda
-   manually (step 1), then have that same user try again — it should fail
-   with `AccessDeniedException`. Check `total_blocked` in the Lambda's
-   response to confirm.
+   Have the test user make one small Bedrock call, invoke the enforcer
+   Lambda manually (step 1), then have that same user try again — it should
+   fail with `AccessDeniedException`. Check `total_blocked` in the Lambda's
+   response to confirm. (Adjust the bonus to `0.01 − <their tier's cap>` if
+   they're not on a $150 tier.)
 
-3. **Restore the real cap:**
+3. **Restore the real cap** by removing the bonus, then invoke the enforcer
+   again — the test user should be unblocked (`newly_unblocked` in the
+   response) and get the "access restored" email:
    ```bash
-   ./deploy.sh -- MonthlyCapUSD=150
+   aws dynamodb update-item \
+     --table-name bedrock-budget-hardstop-blocked-users \
+     --key '{"username": {"S": "<test-username>"}}' \
+     --update-expression "REMOVE bonusUsd" \
+     --region us-west-2
    ```
-   Note: this does **not** automatically unblock the test user — they stay
-   blocked until the monthly reset runs, or until you remove them (see
-   [Removing the block for one individual user](#removing-the-block-for-one-individual-user)).
 
 4. **Verify the modelId mapping** once there's real traffic:
    ```
@@ -408,10 +491,9 @@ Edit `bedrock-budget-hardstop-sso.yaml`, then re-run `./deploy.sh` (with the
 same bucket/overrides as before, if any) — `aws cloudformation deploy` diffs
 against the live stack and only updates what changed. Common edits:
 
-- **Change the cap:** edit `MonthlyCapUSD`'s `Default`, or pass
-  `--parameter-overrides MonthlyCapUSD=<value>` without editing the file
-  (remember: pass it explicitly on `deploy`, editing the `Default` alone
-  isn't picked up for an existing stack).
+- **Change a cap or move a user between tiers:** edit `budget-config.json`
+  and re-run `./deploy.sh` (see [Budget tiers](#budget-tiers)) — no
+  CloudFormation change needed.
 - **Add a new model:** add an entry to `model-pricing.json` and re-run
   `./deploy.sh` (uploads the updated file to S3 — no CloudFormation change
   needed). Get the price from <https://aws.amazon.com/bedrock/pricing/>
@@ -437,7 +519,7 @@ against the live stack and only updates what changed. Common edits:
 ## Whitelisting a user (exempting them from the cap)
 
 Some identities that share this SSO permission set aren't a human with a
-$150/month budget — for example `audrai_ai_agent`, a service account for an
+monthly budget — for example `audrai_ai_agent`, a service account for an
 application, which should never be blocked regardless of spend. That's what
 `ExemptUsernames` is for.
 
@@ -470,6 +552,14 @@ skips the block, not the accounting.
 Exempt users also never receive the 75%/100% per-user SES emails, for the
 same reason they're never blocked.
 
+Exemptions deliberately stay a stack parameter rather than moving into
+`budget-config.json`: they're for application/service accounts that sit
+outside the budget system, they rarely change, and a mistake means unlimited
+spend rather than a wrong cap — so they get the extra friction of a deploy.
+**Don't exempt people**; give them a higher tier or a `bonusUsd` instead, so
+they still have a ceiling. An exempt username that also appears under
+`users` in `budget-config.json` is a validation error.
+
 ## Removing the block for one individual user
 
 Deleting the DynamoDB row alone isn't durable if the user is still
@@ -489,22 +579,25 @@ how they're usually used:
      --region us-west-2 /tmp/out.json && cat /tmp/out.json
    ```
 
-2. **Give them a higher personal cap (not unlimited)** — edit `capUsd` on
-   their item; it's preserved across runs instead of resetting to
-   `MonthlyCapUSD`, and creates the row if they don't have one yet:
+2. **Give them extra budget for this month (not unlimited)** — set
+   `bonusUsd` on their item. It's added on top of their tier's cap (e.g.
+   `50` on a $150 tier = $200 this month), and creates the row if they
+   don't have one yet:
    ```bash
    aws dynamodb update-item \
      --table-name bedrock-budget-hardstop-blocked-users \
      --key '{"username": {"S": "<their-username-or-email>"}}' \
-     --update-expression "SET capUsd = :c" \
-     --expression-attribute-values '{":c": {"S": "300"}}' \
+     --update-expression "SET bonusUsd = :b" \
+     --expression-attribute-values '{":b": {"N": "50"}}' \
      --region us-west-2
 
    aws lambda invoke --function-name bedrock-budget-hardstop-enforcer \
      --region us-west-2 /tmp/out.json
    ```
-   Revert by setting `capUsd` back or deleting the row — it does not
-   auto-revert until the monthly reset clears the whole table.
+   `SET` replaces any existing bonus — to add to one, use
+   `"SET bonusUsd = if_not_exists(bonusUsd, :z) + :b"` with `":z": {"N": "0"}`.
+   It reverts automatically at the monthly reset. Don't edit `capUsd` — it's
+   recomputed and overwritten every run.
 
 3. **Give them unlimited access before month-end** — add to
    `ExemptUsernames` and redeploy (see
@@ -512,8 +605,8 @@ how they're usually used:
 
 4. **Wait for the monthly reset** — 00:05 UTC on the 1st.
 
-5. **Raise `MonthlyCapUSD`** — global, affects every user without a
-   personal `capUsd` override.
+5. **Move them to a higher tier** — permanent; edit `budget-config.json`
+   and run `./deploy.sh` (see [Budget tiers](#budget-tiers)).
 
 ## Monitoring
 
@@ -521,14 +614,17 @@ how they're usually used:
   cost that tripped it), one on the monthly reset, and one if any `modelId`
   shows up in the logs with no matching price entry (meaning its cost isn't
   being counted at all — treat this as a "fix `model-pricing.json` now"
-  alert). Note: exempt-user auto-unblocks (see
+  alert), and one if `budget-config.json` is missing or invalid (meaning
+  enforcement has stopped — fix the file and redeploy). Note: exempt-user auto-unblocks (see
   [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)) are
   silent — check the DynamoDB table or CloudWatch Logs if you need to
   confirm one happened, no email is sent for it.
 - **Per-user SES emails** (if `SesSenderEmail` is set) — sent directly to
-  the affected user (not the admin) at the 75% warning threshold and at
-  the moment they're newly blocked, once each per calendar month (tracked
-  via the `warnedAt`/`blockedAt` DynamoDB fields). These are separate
+  the affected user (not the admin) at the 75% warning threshold, at the
+  moment they're newly blocked, and when a cap increase (tier move or
+  `bonusUsd`) unblocks them — sent only after the Deny is actually removed.
+  The warning is sent once per cap: if the cap changes, it can fire again
+  against the new cap (tracked via `warnedAt`/`warnedAtCapUsd`). These are separate
   from, and in addition to, the batched admin SNS alert above. Exempt
   usernames (and any non-email service-account username) never receive
   these, since they fail the email-format check / are skipped by the same
@@ -546,12 +642,14 @@ how they're usually used:
   |---|---|
   | `username` | Partition key. |
   | `currentUsageUsd` | Month-to-date cost as of `lastUpdated`. |
-  | `capUsd` | Effective cap for this user. Defaults to `MonthlyCapUSD`, then preserved once set — edit directly for a per-user cap (see [Removing the block for one individual user](#removing-the-block-for-one-individual-user)). |
+  | `tier` / `tierCapUsd` | Tier resolved from `budget-config.json` on the last run, and that tier's cap. |
+  | `bonusUsd` | Optional, admin-set. Added to the tier cap until the monthly reset (negative lowers it). The only attribute here meant to be hand-edited — see [Removing the block for one individual user](#removing-the-block-for-one-individual-user). |
+  | `capUsd` | Effective cap on the last run (`tierCapUsd + bonusUsd`). Display only — recomputed every run, editing it does nothing. |
   | `lastUpdated` | ISO timestamp of the last run that saw usage for this user. |
   | `exempt` | Mirrors `ExemptUsernames` membership. |
   | `blocked` | Currently blocked. |
   | `blockedAt` / `costAtBlock` | Set once, when first blocked; not overwritten on later runs. |
-  | `warnedAt` | Set once, the first time this user's usage crosses 75% of their effective cap in a calendar month; not overwritten on later runs, so the 75%-threshold warning email is only ever sent once per user per month. |
+  | `warnedAt` / `warnedAtCapUsd` | When the 75%-threshold warning was sent, and the cap it was sent against. Cleared if the cap changes and usage is below 75% of the new one, so the warning can fire again. |
 
   Scan sorted by spend, highest first (piped through `python3` since
   DynamoDB's raw JSON keeps numbers as strings, so a JMESPath `sort_by`
@@ -560,7 +658,7 @@ how they're usually used:
   aws dynamodb scan \
     --table-name bedrock-budget-hardstop-blocked-users \
     --region us-west-2 \
-    --projection-expression "username, currentUsageUsd, capUsd, blocked, exempt" \
+    --projection-expression "username, currentUsageUsd, capUsd, tier, blocked, exempt" \
     --output json \
   | python3 -c '
 import json, sys
@@ -570,7 +668,8 @@ rows.sort(key=lambda r: float(r["currentUsageUsd"]), reverse=True)
 for r in rows:
     usage, cap, user = r["currentUsageUsd"], r["capUsd"], r["username"]
     blocked, exempt = r.get("blocked", False), r.get("exempt", False)
-    print(f"{usage:>8} / {cap:<6} blocked={blocked!s:<5} exempt={exempt!s:<5} {user}")
+    tier = r.get("tier", "-")
+    print(f"{usage:>8} / {cap:<6} {tier:<9} blocked={blocked!s:<5} exempt={exempt!s:<5} {user}")
 '
   ```
 - **Permission set's actual inline policy**, as the ground truth for what's
@@ -659,18 +758,10 @@ one UTC day, read-only. Useful for validating `model-pricing.json` changes
   (`<role-id>:<session-name>`, which only exists for assumed-role sessions)
   reaches them. If anyone has Bedrock access outside this permission set,
   this system can't cap them.
-- **Per-user warning/block emails are best-effort, and don't re-trigger on
-  a lowered cap.** If a user's `capUsd` is edited downward mid-month
-  *after* they already received the 75% warning email at the old
-  (higher) cap, they will not be re-warned even though they're now
-  closer to (or over) the new, lower threshold — `warnedAt` is set once
-  per calendar month and is not cleared by a `capUsd` edit. The block
-  email and the actual Deny enforcement are unaffected by this — only
-  the warning email can be skipped in this specific sequence. Also, SES
-  delivery itself is best-effort: a send failure (sandbox restriction,
-  unverified recipient, throttling) is caught and logged, never blocks
-  DynamoDB writes or the permission-set Deny rewrite, but also means a
-  user is not guaranteed to actually receive either email — treat the
+- **Per-user emails are best-effort.** A SES send failure (sandbox
+  restriction, unverified recipient, throttling) is caught and logged, never
+  blocks DynamoDB writes or the permission-set Deny rewrite, but also means
+  a user is not guaranteed to actually receive any of the emails — treat the
   admin SNS alert and the DynamoDB table as the authoritative record of
   who's blocked, not the user's inbox.
 
@@ -688,7 +779,13 @@ parameter's `Default` in the file**
 not explicitly passed via `--parameter-overrides` on an update to an
 existing stack — it does **not** pick up a changed `Default` from the
 template file. Always pass the changed parameter explicitly:
-`./deploy.sh -- MonthlyCapUSD=<value>`.
+`./deploy.sh -- EvaluationRateMinutes=<value>`.
+
+**Enforcer errors with "Could not load budget config"**
+`budget-config.json` is missing from the staging bucket or failed
+validation — the error message names the exact problem. Fix the file and
+run `./deploy.sh` (which validates it locally first). Until then no one is
+blocked or unblocked.
 
 **A user isn't getting blocked despite being over cap**
 Check the enforcer's CloudWatch Logs for the run in question, and look at
