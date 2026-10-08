@@ -164,7 +164,7 @@ Parameters:
 
   SesSenderEmail:
     Type: String
-    Default: ""
+    Default: "noreply@billups.com"
     Description: >
       (Optional) verified SES sending identity (email address or domain
       identity's address) used to send per-user budget warning/block
