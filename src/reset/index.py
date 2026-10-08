@@ -1,9 +1,11 @@
 """Bedrock per-user budget monthly reset.
 
 Runs once a month (day 1, 00:05 UTC, via EventBridge cron). Clears the
-DynamoDB blocklist table and removes this system's Deny statement
-(Sid=DENY_SID) from the IAM Identity Center permission set's inline policy,
-so last month's blocks don't carry over into the new month.
+DynamoDB table -- every user item, including any bonusUsd/teamBypass
+exceptions, and every team#<name> ledger item -- and removes this system's
+Deny statement (Sid=DENY_SID) from the IAM Identity Center permission set's
+inline policy, so last month's blocks and exceptions don't carry over into
+the new month.
 
 See src/enforcer/index.py's module docstring, the CloudFormation template's
 header comment, and the project README for the full architecture rationale.

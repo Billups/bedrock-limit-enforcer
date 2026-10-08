@@ -20,6 +20,7 @@ Stack name used in this doc: `bedrock-budget-hardstop`. Template file:
 - [Parameters reference](#parameters-reference)
 - [Model pricing table](#model-pricing-table)
 - [Budget tiers](#budget-tiers)
+- [Teams](#teams)
 - [Deploying](#deploying)
 - [Testing before you trust it](#testing-before-you-trust-it)
 - [Modifying and redeploying](#modifying-and-redeploying)
@@ -104,8 +105,9 @@ Pipeline, run on a schedule (every 15 minutes by default):
    proactively unblock them if they're already blocked.
 5. **Enforce.** Each user's cap is their tier's cap from `budget-config.json`
    plus any temporary `bonusUsd` on their DynamoDB item (see
-   [Budget tiers](#budget-tiers)), recomputed every run. Any non-exempt user
-   at or over their cap gets recorded
+   [Budget tiers](#budget-tiers)), recomputed every run. Team members are
+   also blocked when their team's combined spend reaches the team's cap
+   (see [Teams](#teams)). Any non-exempt user at or over a limit gets recorded
    in DynamoDB. The Lambda then rewrites the permission set's inline policy
    so its Deny statement's `aws:userid` condition matches `*:<username>` for
    every currently-blocked user. An explicit Deny always wins over the
@@ -386,6 +388,62 @@ Items whose `capUsd` equals the old default (`--old-default`, 150) were
 never overrides and are skipped. Deploying right after a monthly reset makes
 this a no-op, since the reset deletes every item.
 
+## Teams
+
+Teams are an optional extra limit on a group's **combined** spend, defined
+in the same `budget-config.json`:
+
+```json
+"teams": {
+  "data-science": {
+    "monthlyCapUsd": 1500,
+    "owner": "lead@billups.com",
+    "members": ["ana@billups.com", "bob@billups.com"]
+  }
+}
+```
+
+- A team's spend is the sum of its members' month-to-date spend. When it
+  reaches `monthlyCapUsd`, every member with usage this month is blocked.
+- Members keep their own tier cap. A user is blocked if **either** their
+  team is over budget **or** they're over their own cap (tier +
+  `bonusUsd`). The team is checked first, which only decides the recorded
+  `blockReason` (`team` / `user`) and which block email they get.
+- A user can be in only one team. Exempt usernames can't be in a team. Both
+  are validation errors (the run stops, same as any invalid config).
+- `owner` is optional. The owner is emailed at 75% of the team budget and
+  when the team is blocked. Being the owner doesn't make them a member;
+  list them in `members` too if their spend should count.
+- Each team has a ledger item in the same DynamoDB table, keyed
+  `team#<name>` (`currentUsageUsd`, `capUsd`, `overBudget`, ...). The
+  monthly reset clears it with everything else.
+
+**When a team is blocked**
+
+| Situation | Do this | Lasts |
+|---|---|---|
+| One member needs to keep working, and is still under their own cap | Set `teamBypass` on their item (below) | Until the monthly reset; they're back on the team on the 1st |
+| One member needs to keep working, and is also over their own cap | Set `teamBypass` **and** a `bonusUsd` on their item | Until the monthly reset |
+| The whole team needs more | Raise the team's `monthlyCapUsd` in `budget-config.json` and run `./deploy.sh` | Permanent (it's the config). Next run unblocks every member except anyone over their own cap |
+| Someone should leave the team for good | Remove them from `members` in `budget-config.json` | Permanent |
+
+```bash
+aws dynamodb update-item \
+  --table-name bedrock-budget-hardstop-blocked-users \
+  --key '{"username": {"S": "<their-username-or-email>"}}' \
+  --update-expression "SET teamBypass = :t" \
+  --expression-attribute-values '{":t": {"BOOL": true}}' \
+  --region us-west-2
+```
+
+A bypassed member's spend **stops counting toward the team from that
+point on**. The first run that sees `teamBypass` freezes their team
+contribution at their spend so far (`teamContributionUsd`), so a later team
+budget increase isn't used up by them, and what they'd already spent stays
+on the team (the team doesn't get unblocked just because someone was
+bypassed). Removing `teamBypass` mid-month puts their full month's spend
+back on the team.
+
 ## Deploying
 
 The Lambda source lives in `src/enforcer/index.py` and `src/reset/index.py`,
@@ -608,13 +666,16 @@ how they're usually used:
 5. **Move them to a higher tier** — permanent; edit `budget-config.json`
    and run `./deploy.sh` (see [Budget tiers](#budget-tiers)).
 
+If their item says `blockReason: team`, raising their own cap won't help —
+their team is over budget. See [Teams](#teams) for `teamBypass`.
+
 ## Monitoring
 
 - **SNS (`AlertTopic`)** — one email when new users get blocked (with the
   cost that tripped it), one on the monthly reset, and one if any `modelId`
   shows up in the logs with no matching price entry (meaning its cost isn't
   being counted at all — treat this as a "fix `model-pricing.json` now"
-  alert), and one if `budget-config.json` is missing or invalid (meaning
+  alert), one when a team reaches its budget, and one if `budget-config.json` is missing or invalid (meaning
   enforcement has stopped — fix the file and redeploy). Note: exempt-user auto-unblocks (see
   [Whitelisting](#whitelisting-a-user-exempting-them-from-the-cap)) are
   silent — check the DynamoDB table or CloudWatch Logs if you need to
@@ -622,7 +683,9 @@ how they're usually used:
 - **Per-user SES emails** (if `SesSenderEmail` is set) — sent directly to
   the affected user (not the admin) at the 75% warning threshold, at the
   moment they're newly blocked, and when a cap increase (tier move or
-  `bonusUsd`) unblocks them — sent only after the Deny is actually removed.
+  `bonusUsd`, team budget raise, `teamBypass`) unblocks them — sent only
+  after the Deny is actually removed. Team owners get a 75% warning and a
+  "team blocked" email for their team.
   The warning is sent once per cap: if the cap changes, it can fire again
   against the new cap (tracked via `warnedAt`/`warnedAtCapUsd`). These are separate
   from, and in addition to, the batched admin SNS alert above. Exempt
@@ -643,13 +706,21 @@ how they're usually used:
   | `username` | Partition key. |
   | `currentUsageUsd` | Month-to-date cost as of `lastUpdated`. |
   | `tier` / `tierCapUsd` | Tier resolved from `budget-config.json` on the last run, and that tier's cap. |
-  | `bonusUsd` | Optional, admin-set. Added to the tier cap until the monthly reset (negative lowers it). The only attribute here meant to be hand-edited — see [Removing the block for one individual user](#removing-the-block-for-one-individual-user). |
+  | `bonusUsd` | Optional, admin-set. Added to the tier cap until the monthly reset (negative lowers it). One of the two attributes meant to be hand-edited — see [Removing the block for one individual user](#removing-the-block-for-one-individual-user). |
+  | `teamBypass` | Optional, admin-set (`true`). Exempts this user from their team's cap until the monthly reset — see [Teams](#teams). |
+  | `team` | Team from `budget-config.json` on the last run, if any. |
+  | `teamContributionUsd` | Set when `teamBypass` is first seen: the spend that stays counted toward the team. |
+  | `blockReason` | `team` or `user`, while blocked. |
   | `capUsd` | Effective cap on the last run (`tierCapUsd + bonusUsd`). Display only — recomputed every run, editing it does nothing. |
   | `lastUpdated` | ISO timestamp of the last run that saw usage for this user. |
   | `exempt` | Mirrors `ExemptUsernames` membership. |
   | `blocked` | Currently blocked. |
   | `blockedAt` / `costAtBlock` | Set once, when first blocked; not overwritten on later runs. |
   | `warnedAt` / `warnedAtCapUsd` | When the 75%-threshold warning was sent, and the cap it was sent against. Cleared if the cap changes and usage is below 75% of the new one, so the warning can fire again. |
+
+  Items keyed `team#<name>` are team ledgers, not users (see [Teams](#teams)):
+  `currentUsageUsd` is the team's counted spend, `capUsd` the team cap,
+  `overBudget` whether its members are blocked.
 
   Scan sorted by spend, highest first (piped through `python3` since
   DynamoDB's raw JSON keeps numbers as strings, so a JMESPath `sort_by`
@@ -764,6 +835,30 @@ one UTC day, read-only. Useful for validating `model-pricing.json` changes
   a user is not guaranteed to actually receive any of the emails — treat the
   admin SNS alert and the DynamoDB table as the authoritative record of
   who's blocked, not the user's inbox.
+
+- **Team members with no usage yet this month aren't blocked in advance.**
+  Only users who appear in this month's logs are evaluated, so when a team
+  goes over budget, a member who hasn't called Bedrock yet this month can
+  still make calls until the next run blocks them — at most one evaluation
+  interval of usage.
+- **Team overshoot is larger than per-user overshoot.** Several members
+  can keep spending during the same evaluation interval before the block
+  lands, so a team can end up noticeably over its cap. Lower
+  `EvaluationRateMinutes` if that matters.
+- **Moving a user between teams mid-month moves their whole month's spend
+  with them** (team spend is the sum of current members' spend). Make team
+  moves on the 1st when possible.
+- **Between 00:00 and the 00:05 UTC reset on the 1st**, the enforcer
+  already sees the new month's (near-zero) usage, but last month's
+  `bonusUsd`/`teamBypass`/`teamContributionUsd` are still in the table until
+  the reset deletes them. This can briefly keep a team blocked or a bonus
+  applied for those few minutes; the reset corrects it.
+- **The Deny statement grows with every blocked person.** Each blocked user
+  is one `*:<username>` entry in the permission set's inline policy, and a
+  team block adds all its active members at once. The inline policy has a
+  size limit; at today's scale this is far off, but a very large team (or
+  org) would eventually need a different mechanism (e.g. Identity Center
+  session tags with one condition per team).
 
 ## Troubleshooting
 

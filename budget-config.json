@@ -5,5 +5,6 @@
     "standard": { "monthlyCapUsd": 150 },
     "power": { "monthlyCapUsd": 300 }
   },
-  "users": {}
+  "users": {},
+  "teams": {}
 }

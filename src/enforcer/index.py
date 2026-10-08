@@ -28,6 +28,16 @@ Runs on a schedule (every EvaluationRateMinutes, via EventBridge). Each run:
      item is updated with their month-to-date usage, tier, and effective
      cap -- the table is a live usage ledger, not just a blocklist. capUsd
      on the item is written for visibility only and never read back.
+  5b. Teams (also from budget-config.json): a team's spend is the sum of
+     its members' month-to-date spend, and when it reaches the team's cap
+     every member is blocked, in addition to (not instead of) their own
+     tier cap. A member with teamBypass set on their DynamoDB item is
+     exempt from the team cap for the rest of the month -- their personal
+     cap still applies, and their spend stops counting toward the team from
+     that point (frozen as teamContributionUsd the first run that sees the
+     flag). The monthly reset clears teamBypass, putting them back on the
+     team. Each team also gets an item in the same table, keyed
+     TEAM_KEY_PREFIX + team name, holding its spend and email state.
   6. Records anyone at or over their effective cap, then rewrites the IAM
      Identity Center permission set's inline policy so its Deny statement
      (Sid=DENY_SID) matches the full current blocklist. This is
@@ -96,6 +106,10 @@ DENIED_ACTIONS = [
 # Fixed by design, not a CFN parameter -- this is a notification-timing
 # detail nobody has asked to tune, unlike the tier caps.
 WARN_THRESHOLD_FRACTION = 0.75
+
+# Team ledger items share the users table. "#" can't appear in an IAM
+# RoleSessionName, so these keys can never collide with a real username.
+TEAM_KEY_PREFIX = "team#"
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
@@ -321,10 +335,117 @@ def parse_bonus(username, existing):
         return 0.0
 
 
-def update_user_item(username, sets, removes):
+def is_team_bypassed(existing):
+    # Hand-set, so accept a DynamoDB BOOL or the string "true".
+    value = existing.get("teamBypass")
+    return value is True or (isinstance(value, str) and value.lower() == "true")
+
+
+def team_contribution(username, existing, cost):
+    """How much of this user's spend counts toward their team. A bypassed
+    member's contribution is frozen at whatever it was when the bypass was
+    first seen; before that first sighting (no teamContributionUsd yet) the
+    caller is about to freeze it at the current cost."""
+    if not is_team_bypassed(existing) or "teamContributionUsd" not in existing:
+        return cost
+    try:
+        return float(existing["teamContributionUsd"])
+    except (TypeError, ValueError):
+        logger.warning("Unparseable teamContributionUsd for %s, counting full spend", username)
+        return cost
+
+
+def was_warned_at(existing, cap):
+    """The 75% warning is tied to the cap it was sent against: if the cap
+    changes (tier move, bonus, team cap edit) it re-arms. Items warned
+    before warnedAtCapUsd existed are assumed to match, so deploying that
+    change didn't re-send that month's warnings."""
+    try:
+        return bool(existing.get("warnedAt")) and (
+            "warnedAtCapUsd" not in existing
+            or float(existing["warnedAtCapUsd"]) == cap
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def evaluate_teams(budget, cost_by_user, existing_by_user, now_iso):
+    """Computes each team's spend, writes its ledger item, and emails the
+    owner at the 75% line and when the team first reaches its cap.
+    Returns ({team name: over budget?}, [(name, spend, cap) newly over])."""
+    spend = {name: 0.0 for name in budget.teams}
+    for username, cost in cost_by_user.items():
+        team = budget.team_for(username)
+        if team:
+            spend[team.name] += team_contribution(username, existing_by_user[username], cost)
+
+    over_by_team = {}
+    newly_over = []
+    for team in budget.teams.values():
+        team_spend = spend[team.name]
+        key = TEAM_KEY_PREFIX + team.name
+        existing = table.get_item(Key={"username": key}).get("Item") or {}
+        was_over = bool(existing.get("overBudget"))
+        was_warned = was_warned_at(existing, team.cap_usd)
+        over = team_spend >= team.cap_usd
+        over_warn_line = not over and team_spend >= WARN_THRESHOLD_FRACTION * team.cap_usd
+        over_by_team[team.name] = over
+
+        sets = {
+            "currentUsageUsd": str(round(team_spend, 2)),
+            "capUsd": str(team.cap_usd),
+            "memberCount": len(team.members),
+            "lastUpdated": now_iso,
+            "overBudget": over,
+        }
+        removes = []
+        if over and not was_over:
+            sets["blockedAt"] = now_iso
+        elif not over:
+            removes.append("blockedAt")
+        if over_warn_line and not was_warned:
+            sets["warnedAt"] = now_iso
+            sets["warnedAtCapUsd"] = str(team.cap_usd)
+        elif not over_warn_line and not was_warned:
+            removes += ["warnedAt", "warnedAtCapUsd"]
+        update_ledger_item(key, sets, removes)
+
+        if team.owner and over_warn_line and not was_warned and not was_over:
+            send_user_email(
+                team.owner,
+                subject=f"Bedrock team budget notice: {team.name} is near its monthly budget",
+                body=(
+                    f"Team {team.name}'s combined Amazon Bedrock usage this "
+                    f"month is ${team_spend:.2f}, which has reached "
+                    f"{WARN_THRESHOLD_FRACTION * 100:.0f}% of its "
+                    f"${team.cap_usd:.0f}/month team budget. If it reaches the "
+                    f"full budget, every member's Bedrock access will be "
+                    f"blocked for the rest of the calendar month."
+                ),
+            )
+        if over and not was_over:
+            newly_over.append((team.name, team_spend, team.cap_usd))
+            if team.owner:
+                send_user_email(
+                    team.owner,
+                    subject=f"Bedrock team budget reached: {team.name} is blocked",
+                    body=(
+                        f"Team {team.name}'s combined Amazon Bedrock usage "
+                        f"this month reached ${team_spend:.2f}, at or above its "
+                        f"${team.cap_usd:.0f}/month team budget. Bedrock access "
+                        f"has been blocked for the team's members for the rest "
+                        f"of the calendar month. Access resets automatically on "
+                        f"the 1st, or ask an administrator to raise the team "
+                        f"budget or exempt individual members from it."
+                    ),
+                )
+    return over_by_team, newly_over
+
+
+def update_ledger_item(username, sets, removes):
     """Writes only the attributes the enforcer owns. An UpdateItem (not a
-    PutItem of the whole item) so a bonusUsd an admin sets between this
-    run's GetItem and this write can't be overwritten."""
+    PutItem of the whole item) so a bonusUsd/teamBypass an admin sets
+    between this run's GetItem and this write can't be overwritten."""
     names = {}
     values = {}
     set_parts = []
@@ -418,32 +539,41 @@ def lambda_handler(event, context):
     # being overwritten on every run. The effective cap is always recomputed
     # from budget-config.json + bonusUsd; the capUsd written here is only a
     # snapshot for whoever reads the table.
+    #
+    # Only users with usage this month are evaluated, so a team member who
+    # hasn't called Bedrock yet isn't blocked in advance when their team is
+    # over budget -- their first call(s) go through, and the next run blocks
+    # them. Accepted: it costs at most one evaluation interval of usage.
     now_iso = datetime.now(timezone.utc).isoformat()
+    existing_by_user = {
+        u: table.get_item(Key={"username": u}).get("Item") or {}
+        for u in cost_by_user
+    }
+    team_over, newly_over_teams = evaluate_teams(budget, cost_by_user, existing_by_user, now_iso)
+
     newly_blocked = []
     newly_warned = []
     newly_unblocked = []
     for username, cost in cost_by_user.items():
         is_exempt = username in EXEMPT_USERNAMES
 
-        existing = table.get_item(Key={"username": username}).get("Item") or {}
+        existing = existing_by_user[username]
         was_blocked = bool(existing.get("blocked"))
         tier = budget.tier_for(username)
         tier_cap = budget.tier_caps[tier]
         effective_cap = tier_cap + parse_bonus(username, existing)
-        # The warning is tied to the cap it was sent against: if the cap
-        # changes (tier move, bonus), it re-arms. Items warned before
-        # warnedAtCapUsd existed are assumed to match, so deploying this
-        # doesn't re-send this month's warnings.
-        try:
-            was_warned = bool(existing.get("warnedAt")) and (
-                "warnedAtCapUsd" not in existing
-                or float(existing["warnedAtCapUsd"]) == effective_cap
-            )
-        except (TypeError, ValueError):
-            was_warned = False
+        was_warned = was_warned_at(existing, effective_cap)
+        team = budget.team_for(username)
+        bypassed = bool(team) and is_team_bypassed(existing)
 
-        should_block = (not is_exempt) and cost >= effective_cap
+        # Team limit first, then the user's own (tier + bonus) -- either one
+        # blocks; the order only decides which reason is recorded/emailed.
+        team_blocked = bool(team) and not bypassed and team_over[team.name]
+        user_over = cost >= effective_cap
+        should_block = (not is_exempt) and (team_blocked or user_over)
         is_unblocking = was_blocked and not should_block
+        # The 75% warning is about the user's own cap only -- team-level
+        # warnings go to the team owner (see evaluate_teams()).
         over_warn_line = (
             (not is_exempt)
             and not should_block
@@ -466,6 +596,18 @@ def lambda_handler(event, context):
             "blocked": should_block,
         }
         removes = []
+        if team:
+            sets["team"] = team.name
+        else:
+            removes.append("team")
+        if bypassed and "teamContributionUsd" not in existing:
+            sets["teamContributionUsd"] = str(round(cost, 2))
+        elif not bypassed:
+            removes.append("teamContributionUsd")
+        if should_block:
+            sets["blockReason"] = "team" if team_blocked else "user"
+        else:
+            removes.append("blockReason")
         if should_block and not was_blocked:
             sets["blockedAt"] = now_iso
             sets["costAtBlock"] = str(round(cost, 2))
@@ -479,7 +621,7 @@ def lambda_handler(event, context):
             # any warning sent against an older cap so it can fire again.
             removes += ["warnedAt", "warnedAtCapUsd"]
 
-        update_user_item(username, sets, removes)
+        update_ledger_item(username, sets, removes)
 
         if should_warn:
             newly_warned.append((username, cost, effective_cap))
@@ -498,18 +640,30 @@ def lambda_handler(event, context):
             )
 
         if should_block and not was_blocked:
-            newly_blocked.append((username, cost, effective_cap, tier))
-            send_user_email(
-                username,
-                subject="Bedrock access blocked: monthly budget reached",
-                body=(
+            reason = f"team {team.name}" if team_blocked else "own cap"
+            newly_blocked.append((username, cost, effective_cap, tier, reason))
+            if team_blocked:
+                body = (
+                    f"Your team ({team.name}) has reached its "
+                    f"${team.cap_usd:.0f}/month Amazon Bedrock team budget, "
+                    f"so Bedrock access has been blocked for its members for "
+                    f"the rest of the calendar month. Your own usage this "
+                    f"month is ${cost:.2f} of your ${effective_cap:.0f} "
+                    f"personal cap. Access resets automatically on the 1st."
+                )
+            else:
+                body = (
                     f"Your personal Amazon Bedrock usage this month reached "
                     f"${cost:.2f}, at or above your ${effective_cap:.0f}/month "
                     f"cap. Your Bedrock access has been blocked for the rest "
                     f"of the calendar month. This is based on your own usage "
                     f"only, not a team-wide limit. Access resets "
                     f"automatically on the 1st."
-                ),
+                )
+            send_user_email(
+                username,
+                subject="Bedrock access blocked: monthly budget reached",
+                body=body,
             )
 
         if is_unblocking and not is_exempt:
@@ -535,7 +689,7 @@ def lambda_handler(event, context):
 
     all_blocked = [
         item["username"] for item in table.scan().get("Items", [])
-        if item.get("blocked")
+        if item.get("blocked") and not item["username"].startswith(TEAM_KEY_PREFIX)
     ]
 
     policy_changed = apply_blocklist(all_blocked)
@@ -545,23 +699,35 @@ def lambda_handler(event, context):
             username,
             subject="Bedrock access restored",
             body=(
-                f"Your Amazon Bedrock monthly cap has been raised to "
-                f"${effective_cap:.0f}, and your access has been restored. "
-                f"Your usage so far this month is ${cost:.2f}. If you reach "
-                f"the new cap, your access will be blocked again for the "
-                f"rest of the calendar month."
+                f"Your Amazon Bedrock access has been restored. Your usage "
+                f"so far this month is ${cost:.2f} of your "
+                f"${effective_cap:.0f}/month cap. If you reach your cap (or "
+                f"your team reaches its budget), your access will be "
+                f"blocked again for the rest of the calendar month."
             ),
         )
 
     if newly_blocked and TOPIC_ARN:
         lines = [
-            f"- {u}: ${c:.2f} (cap ${cap:.0f}, tier {tier})"
-            for u, c, cap, tier in newly_blocked
+            f"- {u}: ${c:.2f} (cap ${cap:.0f}, tier {tier}, blocked by {reason})"
+            for u, c, cap, tier, reason in newly_blocked
         ]
         sns.publish(
             TopicArn=TOPIC_ARN,
             Subject="Bedrock: users blocked",
             Message="Bedrock access was blocked for:\n" + "\n".join(lines),
+        )
+
+    if newly_over_teams and TOPIC_ARN:
+        lines = [f"- {t}: ${sp:.2f} (team cap ${cap:.0f})" for t, sp, cap in newly_over_teams]
+        sns.publish(
+            TopicArn=TOPIC_ARN,
+            Subject="Bedrock: team budgets reached",
+            Message=(
+                "These teams reached their monthly budget; all members with "
+                "usage this month are blocked (except those with teamBypass):\n"
+                + "\n".join(lines)
+            ),
         )
 
     if unpriced_models and TOPIC_ARN:
@@ -590,7 +756,8 @@ def lambda_handler(event, context):
 
     return {
         "evaluated_users": len(cost_by_user),
-        "newly_blocked": [u for u, _, _, _ in newly_blocked],
+        "newly_blocked": [u for u, _, _, _, _ in newly_blocked],
+        "teams_over_budget": sorted(t for t, over in team_over.items() if over),
         "newly_warned": [u for u, _, _ in newly_warned],
         "newly_unblocked": [u for u, _, _ in newly_unblocked],
         "newly_unblocked_exempt": newly_unblocked_exempt,

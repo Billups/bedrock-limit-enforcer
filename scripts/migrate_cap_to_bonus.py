@@ -81,7 +81,8 @@ def main():
     to_migrate = []
     for item in items:
         username = plain(item["username"])
-        if "capUsd" not in item or "bonusUsd" in item:
+        # team#<name> items are team ledgers, not users.
+        if username.startswith("team#") or "capUsd" not in item or "bonusUsd" in item:
             continue
         cap = float(plain(item["capUsd"]))
         if cap == args.old_default:
