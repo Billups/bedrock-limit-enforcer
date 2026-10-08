@@ -3,8 +3,15 @@
   "tiers": {
     "basic": { "monthlyCapUsd": 70 },
     "standard": { "monthlyCapUsd": 150 },
-    "power": { "monthlyCapUsd": 300 }
+    "power": { "monthlyCapUsd": 400 }
   },
-  "users": {},
+  "users": {
+    "oscar.gutierrez@billups.com": {
+      "tier": "power"
+    },
+    "dmitry.semenov@billups.com": {
+      "tier": "power"
+    }
+  },
   "teams": {}
 }

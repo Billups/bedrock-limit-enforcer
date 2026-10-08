@@ -334,7 +334,7 @@ every run:
   "tiers": {
     "basic":    { "monthlyCapUsd": 70 },
     "standard": { "monthlyCapUsd": 150 },
-    "power":    { "monthlyCapUsd": 300 }
+    "power":    { "monthlyCapUsd": 400 }
   },
   "users": {
     "someone@billups.com": { "tier": "power" }
