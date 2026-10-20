@@ -313,6 +313,10 @@ Sourcing notes:
   matches the **In-Region**, short-context (≤272K input tokens) row —
   confirmed identical to the Geo CRIS row for this model and region on the
   Spanish pricing page ($0.22 / $1.32 per 1M).
+- DeepSeek (`deepseek.v3.2`, `us.deepseek.r1-v1:0`) and Qwen3
+  (`qwen.qwen3-*`) prices came from the AWS Price List API for `us-west-2`
+  (standard on-demand, input/output only; these models have no prompt
+  caching), added 2026-10-20 after the "models missing a price entry" alert.
 - If a model shows up in the logs with a shape not listed above (e.g. a
   bare model ID for a model that's only ever been seen via ARN, or a brand
   new model), add it as a new key with the same price as its sibling
