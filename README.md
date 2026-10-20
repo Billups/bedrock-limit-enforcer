@@ -28,6 +28,7 @@ Stack name used in this doc: `bedrock-budget-hardstop`. Template file:
 - [Removing the block for one individual user](#removing-the-block-for-one-individual-user)
 - [Monitoring](#monitoring)
 - [Admin script](#admin-script)
+- [Pricing check script](#pricing-check-script)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
 - [Tearing it down](#tearing-it-down)
@@ -293,6 +294,9 @@ duplicate. Still an exact-match lookup on that trailing segment (see
 [Known limitations](#known-limitations)) — just no longer tied to a
 specific account ID or region baked into an ARN. Each model entry has
 `input`, `output`, `cacheRead`, `cacheWrite5m`, and `cacheWrite1h` rates.
+
+To check the file against AWS's current prices instead of copying them by
+hand, use the [pricing check script](#pricing-check-script).
 
 Sourcing notes:
 
@@ -806,6 +810,49 @@ python3 scripts/usage_report.py 2026-09-29 --user jdoe
 Same Logs Insights query shape and pricing logic as the enforcer, scoped to
 one UTC day, read-only. Useful for validating `model-pricing.json` changes
 (e.g. the cache-write TTL assumption) against real billed amounts.
+
+## Pricing check script
+
+`scripts/update_pricing.py` compares `model-pricing.json` against the AWS
+Price List API, so prices don't have to be copied from the pricing pages by
+hand (which is how the Sonnet 5.5 cache-read rate ended up at twice the
+billed price). It checks every entry, plus any `modelId` seen in the last 30
+days of invocation logs that has no entry yet:
+
+```bash
+python3 scripts/update_pricing.py              # show differences, change nothing
+python3 scripts/update_pricing.py --write      # also rewrite model-pricing.json locally
+python3 scripts/update_pricing.py --check      # exit 1 if anything would change (for CI)
+python3 scripts/update_pricing.py --days 0     # skip the log scan
+```
+
+Example output:
+
+```
+43 entries match the Price List (us-west-2, per 1K tokens).
+CHANGED    us.anthropic.claude-sonnet-5-5: cacheRead 0.00022 -> 0.00011 (-50%, check this)
+MANUAL     openai.gpt-5.6-luna: no us-west-2 entry in the Price List; priced from its model card (see README)
+```
+
+- Read-only by default. `--write` only touches the local file and rewrites
+  just the changed entries; nothing is uploaded. Review the `git diff`, open
+  a PR, then upload to S3 as in [Modifying and redeploying](#modifying-and-redeploying).
+- A `global.` key gets the Global cross-region price; `us.` and unprefixed
+  keys get the standard (Geo / In-region) price. Batch, flex, priority,
+  reserved, long-context and `mantle` prices are ignored.
+- Changes of 25% or more are flagged with `check this`. Before applying
+  one, confirm it against the bill (Cost Explorer, grouped by usage type)
+  or the pricing page.
+- Prices are matched through the `MODEL_NAMES` table at the top of the
+  script (logged model ID → Price List model name). A new model is reported
+  as `UNMAPPED` until a line is added there; it never guesses.
+- Models the Price List doesn't cover for `us-west-2` (currently GPT-5.6
+  Luna) are listed in `MANUAL` and reported, not checked. Keep pricing
+  those by hand, as described in the sourcing notes under
+  [Model pricing table](#model-pricing-table).
+- Needs an AWS profile with `pricing:GetProducts` and, for the log scan,
+  `logs:StartQuery` / `logs:GetQueryResults` on the invocation log group.
+  The shared `bedrock-limited-access` role doesn't have these.
 
 ## Known limitations
 
