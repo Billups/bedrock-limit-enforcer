@@ -61,6 +61,7 @@ MODEL_NAMES = {
     "anthropic.claude-opus-4-5-20251101-v1:0": (CLAUDE, "Claude Opus 4.5"),
     "anthropic.claude-sonnet-4-5-20250929-v1:0": (CLAUDE, "Claude Sonnet 4.5"),
     "anthropic.claude-haiku-4-5-20251001-v1:0": (CLAUDE, "Claude Haiku 4.5"),
+    "anthropic.claude-haiku-5-5": (CLAUDE, "Claude Haiku 5.5"),
     "anthropic.claude-sonnet-4-20250514-v1:0": (CLAUDE, "Claude Sonnet 4"),
     "anthropic.claude-opus-4-1-20250805-v1:0": (CLAUDE, "Claude Opus 4.1"),
     "deepseek.v3.2": (OPEN_WEIGHT, "DeepSeek v3.2"),
@@ -68,11 +69,16 @@ MODEL_NAMES = {
     "qwen.qwen3-235b-a22b-2507-v1:0": (OPEN_WEIGHT, "Qwen3 235B A22B 2507"),
     "qwen.qwen3-coder-480b-a35b-v1:0": (OPEN_WEIGHT, "Qwen3 Coder 480B A35B"),
     "qwen.qwen3-32b-v1:0": (OPEN_WEIGHT, "Qwen3 32B"),
+    "zai.glm-5.3": (OPEN_WEIGHT, "GLM 5.3"),
+    "amazon.nova-2-lite-v1:0": (OPEN_WEIGHT, "Nova 2.0 Lite"),
+    "gpt-5.6-luna": (OPEN_WEIGHT, "OpenAI GPT 5.6 Luna"),
 }
 
 # Priced by hand because the Price List has no usable us-west-2 entry.
 MANUAL = {
     "openai.gpt-5.6-luna": "no us-west-2 entry in the Price List; priced from its model card (see README)",
+    "global.zai.glm-5.3": "not in the Price List yet; priced from the Bedrock pricing page",
+    "us.zai.glm-5.3": "not in the Price List yet; priced from the Bedrock pricing page",
 }
 
 
