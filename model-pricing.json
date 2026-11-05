@@ -44,5 +44,12 @@
   "us.deepseek.r1-v1:0": {"input": 0.00135, "output": 0.0054},
   "qwen.qwen3-235b-a22b-2507-v1:0": {"input": 0.00022, "output": 0.00088},
   "qwen.qwen3-coder-480b-a35b-v1:0": {"input": 0.00045, "output": 0.0018},
-  "qwen.qwen3-32b-v1:0": {"input": 0.00015, "output": 0.0006}
+  "qwen.qwen3-32b-v1:0": {"input": 0.00015, "output": 0.0006},
+  "global.zai.glm-5.3": {"input": 0.00168, "output": 0.00528, "cacheWrite5m": 0.0021, "cacheRead": 0.000312},
+  "us.zai.glm-5.3": {"input": 0.001848, "output": 0.005808, "cacheWrite5m": 0.00231, "cacheRead": 0.0003432},
+  "amazon.nova-2-lite-v1:0": {"input": 0.00033, "output": 0.00275, "cacheWrite5m": 0, "cacheRead": 0.0000825},
+  "us.amazon.nova-2-lite-v1:0": {"input": 0.00033, "output": 0.00275, "cacheWrite5m": 0, "cacheRead": 0.0000825},
+  "global.amazon.nova-2-lite-v1:0": {"input": 0.0003, "output": 0.0025, "cacheWrite5m": 0, "cacheRead": 0.000075},
+  "global.anthropic.claude-haiku-5-5": {"input": 0.0001, "output": 0.0005, "cacheWrite5m": 0.000125, "cacheWrite1h": 0.0002, "cacheRead": 0.00001},
+  "us.anthropic.claude-haiku-5-5": {"input": 0.00011, "output": 0.00055, "cacheWrite5m": 0.0001375, "cacheWrite1h": 0.00022, "cacheRead": 0.000011}
 }
