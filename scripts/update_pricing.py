@@ -53,6 +53,7 @@ MODEL_NAMES = {
     "anthropic.claude-opus-5": (CLAUDE, "Claude Opus 5"),
     "anthropic.claude-sonnet-5-5": (CLAUDE, "Claude Sonnet 5.5"),
     "anthropic.claude-sonnet-5": (CLAUDE, "Claude Sonnet 5"),
+    "anthropic.claude-fable-5-2": (CLAUDE, "Claude Fable 5.2"),
     "anthropic.claude-fable-5-1": (CLAUDE, "Claude Fable 5.1"),
     "anthropic.claude-opus-4-8": (CLAUDE, "Claude Opus 4.8"),
     "anthropic.claude-opus-4-7": (CLAUDE, "Claude Opus 4.7"),
