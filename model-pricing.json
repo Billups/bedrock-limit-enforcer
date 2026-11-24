@@ -54,5 +54,6 @@
   "us.amazon.nova-2-lite-v1:0": {"input": 0.00033, "output": 0.00275, "cacheWrite5m": 0, "cacheRead": 0.0000825},
   "global.amazon.nova-2-lite-v1:0": {"input": 0.0003, "output": 0.0025, "cacheWrite5m": 0, "cacheRead": 0.000075},
   "global.anthropic.claude-haiku-5-5": {"input": 0.0001, "output": 0.0005, "cacheWrite5m": 0.000125, "cacheWrite1h": 0.0002, "cacheRead": 0.00001},
-  "us.anthropic.claude-haiku-5-5": {"input": 0.00011, "output": 0.00055, "cacheWrite5m": 0.0001375, "cacheWrite1h": 0.00022, "cacheRead": 0.000011}
+  "us.anthropic.claude-haiku-5-5": {"input": 0.00011, "output": 0.00055, "cacheWrite5m": 0.0001375, "cacheWrite1h": 0.00022, "cacheRead": 0.000011},
+  "minimax.minimax-m2.5": {"input": 0.0003, "output": 0.0012}
 }
